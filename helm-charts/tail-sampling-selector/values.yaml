@@ -1,0 +1,358 @@
+##############################################################################
+# Tail Sampling Selector - Helm Chart Values
+##############################################################################
+
+# Global settings applied to all resources
+global:
+  image:
+    repository: ghcr.io/your-org/tail-sampling-selector
+    pullPolicy: IfNotPresent
+    tag: ""
+  imagePullSecrets: []
+  # Override common labels applied to all resources
+  labels: {}
+
+# Replica count configuration
+replicaCount: 1
+
+# Image configuration
+image:
+  repository: ghcr.io/your-org/tail-sampling-selector
+  pullPolicy: IfNotPresent
+  tag: "latest"
+
+# Image pull secrets for private registries
+imagePullSecrets: []
+  # - name: registry-secret
+
+# Service account configuration
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Pod security context
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container security context
+containerSecurityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
+
+# Pod annotations
+podAnnotations: {}
+
+# Pod topology spread constraints
+topologySpreadConstraints: []
+  # - maxSkew: 1
+  #   topologyKey: topology.kubernetes.io/zone
+  #   whenUnsatisfiable: ScheduleAnyway
+  #   labelSelector:
+  #     matchLabels:
+  #       app.kubernetes.io/name: tail-sampling-selector
+
+# Resources configuration
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 1000m
+    memory: 1Gi
+
+# Liveness and readiness probes
+livenessProbe:
+  httpGet:
+    path: /health/live
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+  timeoutSeconds: 5
+  failureThreshold: 3
+  successThreshold: 1
+
+readinessProbe:
+  httpGet:
+    path: /health/ready
+    port: http
+  initialDelaySeconds: 5
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 3
+  successThreshold: 1
+
+# Startup probe for slow starting pods
+startupProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 0
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 30
+  successThreshold: 1
+
+# Service configuration
+service:
+  type: ClusterIP
+  port: 8080
+  metricsPort: 9090
+
+# Ingress configuration (optional)
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+    # kubernetes.io/tls-acme: "true"
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+  tls: []
+    # - secretName: chart-example-tls
+    #   hosts:
+    #     - chart-example.local
+
+# Configuration - can be provided via configmap or environment variables
+config:
+  # Enable external configmap (provide your own)
+  existingConfigMap: ""
+
+  # Application configuration
+  app:
+    instanceId: ""
+    maxBufferSpans: 1000000
+    maxBufferTraces: 100000
+    shutdownTimeoutSecs: 30
+    evaluationWorkers: 4
+    gracefulShutdown: true
+    inactivityTimeoutSecs: 600
+    maxTraceDurationSecs: 10800
+
+  # Kafka configuration (AutoMQ compatible)
+  kafka:
+    brokers: "automq:9092"
+    inputTopic: "otel-traces-raw"
+    consumerGroup: "tail-sampling-selector"
+    autoOffsetReset: "latest"
+    enableAutoCommit: true
+    sessionTimeoutMs: 30000
+    saslMechanism: ""
+    saslUsername: ""
+    saslPassword: ""
+    sslCaPath: ""
+    sslCertPath: ""
+    sslKeyPath: ""
+
+  # Redis configuration
+  redis:
+    url: "redis://redis:6379"
+    password: ""
+    poolSize: 10
+    connectionTimeoutSecs: 5
+    traceTtlSecs: 3600
+
+  # Datadog configuration
+  datadog:
+    apiEndpoint: "https://api.datadoghq.com"
+    apiKey: ""
+    applicationKey: ""
+    batchEnabled: true
+    batchSize: 100
+    batchTimeoutSecs: 5
+    requestTimeoutSecs: 30
+    maxRetries: 3
+    retryInitialDelayMs: 1000
+
+  # Sampling configuration
+  sampling:
+    alwaysSampleErrors: true
+    errorSampleRate: 1.0
+    sampleLatency: false
+    latencyThresholdMs: 5000
+    latencySampleRate: 0.1
+
+  # Observability configuration
+  observability:
+    logLevel: "info"
+    jsonLogging: true
+    enablePrometheus: true
+    metricsPort: 9090
+    metricsAddr: "0.0.0.0"
+    enableHealthCheck: true
+    healthPort: 8080
+    healthAddr: "0.0.0.0"
+    serviceName: "tail-sampling-selector"
+
+  # Storage configuration
+  storage:
+    # Storage backend type: "memory" or "iceberg"
+    # - memory: In-memory trace buffer (default, higher memory usage)
+    # - iceberg: Apache Iceberg storage via Lakekeeper (recommended for production)
+    type: "memory"
+
+    # Iceberg storage configuration (required when storage.type = "iceberg")
+    iceberg:
+      # Iceberg REST catalog URI (Lakekeeper)
+      catalogUri: "http://lakekeeper:8181"
+      # S3 warehouse path
+      warehouse: "s3://warehouse/"
+      # Iceberg namespace for trace tables
+      namespace: "traces"
+      # Iceberg table name for spans
+      tableName: "spans"
+      # Inactivity threshold (ms) before trace is considered complete
+      inactivityThresholdMs: 60000
+      # S3/Garage endpoint for object storage
+      s3Endpoint: "http://garage:3900"
+      # S3 region (use "garage" for Garage)
+      s3Region: "garage"
+      # Enable S3 path-style access (required for MinIO/Garage)
+      s3PathStyle: true
+
+  # Force sampling configuration
+  forceSampling:
+    enabled: true
+    pollIntervalSecs: 5
+    usePubsub: true
+    pubsubChannel: "tss:force_rules:updates"
+
+  # Span compression configuration
+  spanCompression:
+    enabled: true
+    minCompressionCount: 3
+    compressionWindowSecs: 60
+    maxSpanDurationSecs: 60
+
+# OIDC Authentication configuration (for Admin API)
+oidc:
+  # Enable OIDC authentication for /admin/* endpoints
+  enabled: false
+  # OIDC issuer URL (e.g., "https://your-idp.example.com/realms/your-realm")
+  issuerUrl: ""
+  # OIDC client ID
+  clientId: ""
+  # OIDC audience (optional, for token validation)
+  audience: ""
+  # Required scopes for admin access
+  requiredScopes:
+    - "openid"
+    - "profile"
+  # Required roles/groups for admin access (claim-dependent)
+  requiredRoles: []
+  # JWT claim containing roles/groups (e.g., "roles", "groups", "realm_access.roles")
+  rolesClaim: "roles"
+  # Cache JWKS for performance (seconds)
+  jwksCacheSecs: 300
+
+# Environment variables - secret values
+env: []
+  # - name: TSS_DATADOG_API_KEY
+  #   valueFrom:
+  #     secretKeyRef:
+  #       name: datadog-secret
+  #       key: api-key
+  #       optional: false
+
+# S3 credentials for Iceberg storage (Garage/MinIO)
+s3Credentials:
+  # Create a secret for S3 credentials
+  create: false
+  # Existing secret name (if create=false)
+  existingSecret: ""
+  # S3 access key ID
+  accessKeyId: ""
+  # S3 secret access key
+  secretAccessKey: ""
+
+# Secrets to mount as files
+secrets: []
+  # - name: kafka-certs
+  #   secretName: kafka-certs
+  #   items:
+  #     - key: ca.crt
+  #       path: kafka-ca.crt
+
+# Volumes
+volumes: []
+  # - name: config
+  #   configMap:
+  #     name: tail-sampling-selector-config
+
+# Volume mounts
+volumeMounts: []
+  # - name: config
+  #   mountPath: /etc/tail-sampling-selector
+  #   readOnly: true
+
+# Priority class
+priorityClassName: ""
+
+# Node selector
+nodeSelector: {}
+
+# Tolerations
+tolerations: []
+
+# Affinity
+affinity: {}
+
+# KEDA Autoscaling Configuration
+keda:
+  enabled: true
+  scaledObjectName: ""
+  pollingInterval: 15
+  cooldownPeriod: 300
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  fallback: {}
+    # failureThreshold: 3
+    # replicas: 2
+  # Kafka/AutoMQ scaler configuration
+  kafka:
+    brokers: "automq:9092"
+    consumerGroup: "tail-sampling-selector"
+    topic: "otel-traces-raw"
+    offsetReset: "latest"
+    lagThreshold: "100"
+    scope: "consumergroup"
+    # SASL authentication (optional, for secured AutoMQ)
+    sasl: ""
+    tls: ""
+
+# Redis sub-chart configuration
+redis:
+  enabled: false
+  architecture: standalone
+  auth:
+    enabled: true
+    existingSecret: redis-secret
+  commonConfiguration: |
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+  master:
+    resources:
+      requests:
+        cpu: 100m
+        memory: 128Mi
+      limits:
+        cpu: 500m
+        memory: 512Mi
+
+# External Redis (when redis.enabled is false)
+externalRedis:
+  host: "redis"
+  port: 6379
+  database: 0
+  existingSecret: ""
+  existingSecretPasswordKey: "redis-password"

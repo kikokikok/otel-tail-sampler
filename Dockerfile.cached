@@ -1,0 +1,63 @@
+# Dockerfile with dependency caching - builds in ~5-10 min after first build
+# First build: ~20-30 min (compiles all deps)
+# Subsequent builds: ~2-5 min (only recompiles your code)
+
+FROM rust:1.92-slim AS deps-builder
+
+RUN apt-get update && apt-get install -y \
+    cmake \
+    build-essential \
+    libsasl2-dev \
+    libssl-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Step 1: Create a dummy project with our dependencies
+COPY Cargo.toml Cargo.lock ./
+
+# Create dummy src to build dependencies
+RUN mkdir -p src/bin && \
+    echo 'fn main() { println!("deps"); }' > src/main.rs && \
+    echo 'fn main() { println!("deps"); }' > src/bin/simple_producer.rs && \
+    echo 'fn main() { println!("deps"); }' > src/bin/test_env.rs && \
+    echo '' > src/lib.rs
+
+# Build dependencies only (this layer is cached)
+ARG FEATURES="iceberg-storage"
+RUN cargo build --features "$FEATURES" && \
+    rm -rf src
+
+# Step 2: Build actual code
+FROM deps-builder AS builder
+
+# Copy real source code
+COPY src ./src
+COPY scripts ./scripts
+
+# Build the actual binary (deps already compiled)
+ARG FEATURES="iceberg-storage"
+RUN touch src/main.rs src/lib.rs && \
+    cargo build --features "$FEATURES"
+
+# Final runtime image - must match builder base (trixie) for glibc compatibility
+FROM debian:trixie-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3t64 \
+    libsasl2-2 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=builder /app/target/debug/tail-sampling-selector /usr/local/bin/
+COPY --from=builder /app/target/debug/simple_producer /usr/local/bin/ 
+
+COPY config ./config
+
+EXPOSE 8080 9090
+
+ENV TSS_ENVIRONMENT=development
+
+CMD ["tail-sampling-selector"]

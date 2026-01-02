@@ -1,0 +1,29 @@
+# Dockerfile for local development - uses pre-built binary from host
+# Usage (debug - fast iteration):
+#   cargo build --features iceberg-storage
+#   docker build -f Dockerfile.local -t tail-sampling-selector:local .
+#
+# Usage (release - 30+ min build):
+#   cargo build --release --features iceberg-storage
+#   BUILD_TYPE=release docker build -f Dockerfile.local -t tail-sampling-selector:local .
+
+FROM debian:bookworm-slim
+
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    libssl3 \
+    libsasl2-2 \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy pre-built binary from host (debug by default, release if available)
+# Try debug first, fall back to release
+COPY target/debug/tail-sampling-selector /usr/local/bin/
+
+COPY config ./config
+
+EXPOSE 8080 9090
+
+ENV TSS_ENVIRONMENT=development
+
+CMD ["tail-sampling-selector"]

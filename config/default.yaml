@@ -1,0 +1,77 @@
+app:
+  instance_id: "default"
+  max_buffer_spans: 1000000
+  max_buffer_traces: 100000
+  evaluation_interval_secs: 1
+  shutdown_timeout_secs: 30
+  evaluation_workers: 4
+  graceful_shutdown: true
+  inactivity_timeout_secs: 60
+  max_trace_duration_secs: 300
+
+kafka:
+  brokers: "localhost:9092"
+  input_topic: "otel-traces-raw"
+  consumer_group: "tail-sampling-selector"
+  consumer_threads: 1
+  auto_offset_reset: "latest"
+  enable_auto_commit: false
+  session_timeout_ms: 30000
+
+redis:
+  url: "redis://127.0.0.1/"
+  db: 0
+  pool_size: 10
+  connection_timeout_secs: 5
+  trace_ttl_secs: 30
+  cluster_enabled: false
+
+datadog:
+  api_endpoint: "https://api.datadoghq.com"
+  batch_enabled: true
+  batch_size: 100
+  batch_timeout_secs: 5
+  request_timeout_secs: 30
+  max_retries: 3
+  retry_initial_delay_ms: 1000
+
+sampling:
+  always_sample_errors: true
+  error_sample_rate: 1.0
+  sample_latency: true
+  latency_threshold_ms: 30000
+  latency_sample_rate: 1.0
+
+observability:
+  log_level: "info"
+  json_logging: true
+  enable_prometheus: true
+  metrics_port: 9090
+  metrics_addr: "0.0.0.0"
+  enable_health_check: true
+  health_port: 8080
+  health_addr: "0.0.0.0"
+  service_name: "tail-sampling-selector"
+
+span_compression:
+  enabled: true
+  min_compression_count: 3
+  compression_window_secs: 60
+  max_span_duration_secs: 60
+
+force_sampling:
+  enabled: true
+  poll_interval_secs: 5
+  use_pubsub: true
+  pubsub_channel: "tss:force_rules:updates"
+
+storage:
+  storage_type: "memory"
+  # Iceberg configuration (used when storage_type: "iceberg")
+  # iceberg:
+  #   catalog_uri: "http://localhost:8181/catalog"
+  #   warehouse: "traces"
+  #   namespace: "default"
+  #   table_name: "spans"
+  #   inactivity_threshold_ms: 60000
+  #   project_id: "your-project-id"  # Required for Lakekeeper

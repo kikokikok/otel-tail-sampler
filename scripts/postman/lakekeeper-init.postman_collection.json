@@ -1,0 +1,186 @@
+{
+  "info": {
+    "name": "Lakekeeper Initialization",
+    "_postman_id": "lakekeeper-init-001",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {"key": "baseUrl", "value": "http://lakekeeper:8181"},
+    {"key": "projectId", "value": "00000000-0000-0000-0000-000000000000"},
+    {"key": "warehouseId", "value": ""},
+    {"key": "warehouseName", "value": "traces"},
+    {"key": "namespaceName", "value": "default"},
+    {"key": "minioHost", "value": "minio:9000"},
+    {"key": "minioAccessKey", "value": "minioadmin"},
+    {"key": "minioSecretKey", "value": "minioadmin123"},
+    {"key": "bucketName", "value": "iceberg-warehouse"}
+  ],
+  "item": [
+    {
+      "name": "0. Bootstrap Lakekeeper",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200 || pm.response.code === 204) {",
+              "    console.log('Lakekeeper bootstrapped successfully');",
+              "} else if (pm.response.code === 409) {",
+              "    console.log('Lakekeeper already bootstrapped');",
+              "} else {",
+              "    console.log('Bootstrap response:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [{"key": "Content-Type", "value": "application/json"}],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"accept-terms-of-use\": true}"
+        },
+        "url": "{{baseUrl}}/management/v1/bootstrap"
+      }
+    },
+    {
+      "name": "1. Create Warehouse",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 201 || pm.response.code === 200) {",
+              "    const resp = pm.response.json();",
+              "    pm.collectionVariables.set('warehouseId', resp['warehouse-id']);",
+              "    console.log('Created warehouse:', resp['warehouse-id']);",
+              "} else if (pm.response.code === 409) {",
+              "    console.log('Warehouse already exists, will fetch existing...');",
+              "} else {",
+              "    console.log('Warehouse response:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Content-Type", "value": "application/json"},
+          {"key": "x-project-id", "value": "{{projectId}}"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"warehouse-name\": \"{{warehouseName}}\",\n  \"storage-profile\": {\n    \"type\": \"s3\",\n    \"bucket\": \"{{bucketName}}\",\n    \"region\": \"us-east-1\",\n    \"path-style-access\": true,\n    \"endpoint\": \"http://{{minioHost}}\",\n    \"sts-enabled\": false,\n    \"key-prefix\": \"warehouse\"\n  },\n  \"storage-credential\": {\n    \"type\": \"s3\",\n    \"credential-type\": \"access-key\",\n    \"aws-access-key-id\": \"{{minioAccessKey}}\",\n    \"aws-secret-access-key\": \"{{minioSecretKey}}\"\n  }\n}"
+        },
+        "url": "{{baseUrl}}/management/v1/warehouse"
+      }
+    },
+    {
+      "name": "1b. Get Existing Warehouse (fallback)",
+      "event": [
+        {
+          "listen": "prerequest",
+          "script": {
+            "exec": [
+              "if (pm.collectionVariables.get('warehouseId')) {",
+              "    pm.execution.skipRequest();",
+              "}"
+            ]
+          }
+        },
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200) {",
+              "    const resp = pm.response.json();",
+              "    const warehouseName = pm.collectionVariables.get('warehouseName');",
+              "    if (resp.warehouses && resp.warehouses.length > 0) {",
+              "        const wh = resp.warehouses.find(w => w.name === warehouseName) || resp.warehouses[0];",
+              "        pm.collectionVariables.set('warehouseId', wh.id);",
+              "        console.log('Using existing warehouse:', wh.id);",
+              "    }",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "GET",
+        "header": [{"key": "x-project-id", "value": "{{projectId}}"}],
+        "url": "{{baseUrl}}/management/v1/warehouse"
+      }
+    },
+    {
+      "name": "2. Create Namespace",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200 || pm.response.code === 201) {",
+              "    console.log('Namespace created successfully');",
+              "} else if (pm.response.code === 409) {",
+              "    console.log('Namespace already exists');",
+              "} else {",
+              "    console.log('Namespace response:', pm.response.code, pm.response.text());",
+              "}"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Content-Type", "value": "application/json"},
+          {"key": "x-project-id", "value": "{{projectId}}"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\"namespace\": [\"{{namespaceName}}\"]}"
+        },
+        "url": "{{baseUrl}}/catalog/v1/{{warehouseId}}/namespaces"
+      }
+    },
+    {
+      "name": "3. Create Spans Table",
+      "event": [
+        {
+          "listen": "test",
+          "script": {
+            "exec": [
+              "if (pm.response.code === 200 || pm.response.code === 201) {",
+              "    console.log('Table created successfully');",
+              "} else if (pm.response.code === 409) {",
+              "    console.log('Table already exists');",
+              "} else {",
+              "    console.log('Table response:', pm.response.code, pm.response.text());",
+              "}",
+              "",
+              "console.log('');",
+              "console.log('=== Initialization Complete ===');",
+              "console.log('PROJECT_ID=' + pm.collectionVariables.get('projectId'));",
+              "console.log('WAREHOUSE_ID=' + pm.collectionVariables.get('warehouseId'));",
+              "console.log('WAREHOUSE_NAME=' + pm.collectionVariables.get('warehouseName'));",
+              "console.log('NAMESPACE=' + pm.collectionVariables.get('namespaceName'));"
+            ]
+          }
+        }
+      ],
+      "request": {
+        "method": "POST",
+        "header": [
+          {"key": "Content-Type", "value": "application/json"},
+          {"key": "x-project-id", "value": "{{projectId}}"}
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"spans\",\n  \"schema\": {\n    \"type\": \"struct\",\n    \"fields\": [\n      {\"id\": 1, \"name\": \"trace_id\", \"type\": \"string\", \"required\": true},\n      {\"id\": 2, \"name\": \"span_id\", \"type\": \"string\", \"required\": true},\n      {\"id\": 3, \"name\": \"parent_span_id\", \"type\": \"string\", \"required\": false},\n      {\"id\": 4, \"name\": \"timestamp_ms\", \"type\": \"long\", \"required\": true},\n      {\"id\": 5, \"name\": \"duration_ms\", \"type\": \"long\", \"required\": true},\n      {\"id\": 6, \"name\": \"status_code\", \"type\": \"int\", \"required\": true},\n      {\"id\": 7, \"name\": \"span_kind\", \"type\": \"int\", \"required\": false},\n      {\"id\": 8, \"name\": \"service_name\", \"type\": \"string\", \"required\": true},\n      {\"id\": 9, \"name\": \"operation_name\", \"type\": \"string\", \"required\": true}\n    ]\n  },\n  \"partition-spec\": {\"fields\": []},\n  \"write-order\": {\"order-id\": 0, \"fields\": []},\n  \"properties\": {}\n}"
+        },
+        "url": "{{baseUrl}}/catalog/v1/{{warehouseId}}/namespaces/{{namespaceName}}/tables"
+      }
+    }
+  ]
+}

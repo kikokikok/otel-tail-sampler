@@ -1,0 +1,218 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "tail-sampling-selector.fullname" . | quote }}
+  namespace: {{ .Release.Namespace | quote }}
+  labels:
+    {{- include "tail-sampling-selector.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "tail-sampling-selector.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "tail-sampling-selector.labels" . | nindent 8 }}
+        {{- include "tail-sampling-selector.selectorLabels" . | nindent 8 }}
+    spec:
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      serviceAccountName: {{ include "tail-sampling-selector.serviceAccountName" . | quote }}
+      {{- with .Values.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: {{ .Chart.Name | quote }}
+          image: {{ include "tail-sampling-selector.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy | quote }}
+          {{- with .Values.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.service.port }}
+              protocol: TCP
+            - name: metrics
+              containerPort: {{ .Values.config.observability.metricsPort | default 9090 }}
+              protocol: TCP
+          env:
+            {{- if eq .Values.config.storage.type "iceberg" }}
+            {{- if .Values.s3Credentials.create }}
+            - name: TSS_STORAGE_ICEBERG_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "tail-sampling-selector.fullname" . }}-s3
+                  key: access-key-id
+            - name: TSS_STORAGE_ICEBERG_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "tail-sampling-selector.fullname" . }}-s3
+                  key: secret-access-key
+            {{- else if .Values.s3Credentials.existingSecret }}
+            - name: TSS_STORAGE_ICEBERG_S3_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3Credentials.existingSecret }}
+                  key: access-key-id
+            - name: TSS_STORAGE_ICEBERG_S3_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.s3Credentials.existingSecret }}
+                  key: secret-access-key
+            {{- end }}
+            {{- end }}
+            {{- range .Values.env }}
+            - name: {{ .name | quote }}
+              {{- if .value }}
+              value: {{ .value | quote }}
+              {{- else if .valueFrom }}
+              valueFrom:
+                {{- toYaml .valueFrom | nindent 16 }}
+              {{- end }}
+            {{- end }}
+          {{- if .Values.envFrom }}
+          envFrom:
+            {{- toYaml .Values.envFrom | nindent 12 }}
+          {{- end }}
+          {{- with .Values.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          {{- with .Values.livenessProbe }}
+          livenessProbe:
+            httpGet:
+              path: {{ .httpGet.path | quote }}
+              port: {{ .httpGet.port }}
+            initialDelaySeconds: {{ .initialDelaySeconds | default 10 }}
+            periodSeconds: {{ .periodSeconds | default 10 }}
+            timeoutSeconds: {{ .timeoutSeconds | default 5 }}
+            failureThreshold: {{ .failureThreshold | default 3 }}
+          {{- end }}
+          {{- with .Values.readinessProbe }}
+          readinessProbe:
+            httpGet:
+              path: {{ .httpGet.path | quote }}
+              port: {{ .httpGet.port }}
+            initialDelaySeconds: {{ .initialDelaySeconds | default 5 }}
+            periodSeconds: {{ .periodSeconds | default 5 }}
+            timeoutSeconds: {{ .timeoutSeconds | default 3 }}
+            failureThreshold: {{ .failureThreshold | default 3 }}
+          {{- end }}
+          command:
+            - /bin/bash
+            - -c
+            - |
+              cat > /etc/tail-sampling-selector/config.yaml << 'EOF'
+              app:
+                instance_id: {{ .Values.config.app.instanceId | default (printf "%s-%d" .Release.Name (.Release.Revision | default 1)) | quote }}
+                max_buffer_spans: {{ .Values.config.app.maxBufferSpans | default 1000000 }}
+                max_buffer_traces: {{ .Values.config.app.maxBufferTraces | default 100000 }}
+                shutdown_timeout_secs: {{ .Values.config.app.shutdownTimeoutSecs | default 30 }}
+                evaluation_workers: {{ .Values.config.app.evaluationWorkers | default 4 }}
+                graceful_shutdown: {{ .Values.config.app.gracefulShutdown | default true }}
+                inactivity_timeout_secs: {{ .Values.config.app.inactivityTimeoutSecs | default 600 }}
+                max_trace_duration_secs: {{ .Values.config.app.maxTraceDurationSecs | default 10800 }}
+
+              kafka:
+                brokers: {{ .Values.config.kafka.brokers | quote }}
+                input_topic: {{ .Values.config.kafka.inputTopic | quote }}
+                consumer_group: {{ .Values.config.kafka.consumerGroup | quote }}
+                auto_offset_reset: {{ .Values.config.kafka.autoOffsetReset | default "latest" | quote }}
+                enable_auto_commit: {{ .Values.config.kafka.enableAutoCommit | default true }}
+                session_timeout_ms: {{ .Values.config.kafka.sessionTimeoutMs | default 30000 }}
+
+              redis:
+                url: {{ .Values.config.redis.url | quote }}
+                pool_size: {{ .Values.config.redis.poolSize | default 10 }}
+                connection_timeout_secs: {{ .Values.config.redis.connectionTimeoutSecs | default 5 }}
+                trace_ttl_secs: {{ .Values.config.redis.traceTtlSecs | default 3600 }}
+
+              datadog:
+                api_endpoint: {{ .Values.config.datadog.apiEndpoint | quote }}
+                api_key: {{ .Values.config.datadog.apiKey | default "" | quote }}
+                application_key: {{ .Values.config.datadog.applicationKey | default "" | quote }}
+                batch_enabled: {{ .Values.config.datadog.batchEnabled | default true }}
+                batch_size: {{ .Values.config.datadog.batchSize | default 100 }}
+                batch_timeout_secs: {{ .Values.config.datadog.batchTimeoutSecs | default 5 }}
+                request_timeout_secs: {{ .Values.config.datadog.requestTimeoutSecs | default 30 }}
+                max_retries: {{ .Values.config.datadog.maxRetries | default 3 }}
+                retry_initial_delay_ms: {{ .Values.config.datadog.retryInitialDelayMs | default 1000 }}
+
+              sampling:
+                always_sample_errors: {{ .Values.config.sampling.alwaysSampleErrors | default true }}
+                error_sample_rate: {{ .Values.config.sampling.errorSampleRate | default 1.0 }}
+
+              observability:
+                log_level: {{ .Values.config.observability.logLevel | default "info" | quote }}
+                json_logging: {{ .Values.config.observability.jsonLogging | default true }}
+                enable_prometheus: {{ .Values.config.observability.enablePrometheus | default true }}
+                metrics_port: {{ .Values.config.observability.metricsPort | default 9090 }}
+                enable_health_check: {{ .Values.config.observability.enableHealthCheck | default true }}
+                health_port: {{ .Values.config.observability.healthPort | default 8080 }}
+                service_name: {{ .Values.config.observability.serviceName | default "tail-sampling-selector" | quote }}
+
+              storage:
+                storage_type: {{ .Values.config.storage.type | default "memory" | quote }}
+              {{- if eq .Values.config.storage.type "iceberg" }}
+                iceberg:
+                  catalog_uri: {{ .Values.config.storage.iceberg.catalogUri | quote }}
+                  warehouse: {{ .Values.config.storage.iceberg.warehouse | quote }}
+                  namespace: {{ .Values.config.storage.iceberg.namespace | default "traces" | quote }}
+                  table_name: {{ .Values.config.storage.iceberg.tableName | default "spans" | quote }}
+                  inactivity_threshold_ms: {{ .Values.config.storage.iceberg.inactivityThresholdMs | default 60000 }}
+                  s3_endpoint: {{ .Values.config.storage.iceberg.s3Endpoint | quote }}
+                  s3_region: {{ .Values.config.storage.iceberg.s3Region | default "us-east-1" | quote }}
+                  s3_path_style: {{ .Values.config.storage.iceberg.s3PathStyle | default true }}
+              {{- end }}
+
+              force_sampling:
+                enabled: {{ .Values.config.forceSampling.enabled | default true }}
+                poll_interval_secs: {{ .Values.config.forceSampling.pollIntervalSecs | default 5 }}
+                use_pubsub: {{ .Values.config.forceSampling.usePubsub | default true }}
+                pubsub_channel: {{ .Values.config.forceSampling.pubsubChannel | default "tss:force_rules:updates" | quote }}
+
+              span_compression:
+                enabled: {{ .Values.config.spanCompression.enabled | default true }}
+                min_compression_count: {{ .Values.config.spanCompression.minCompressionCount | default 3 }}
+                compression_window_secs: {{ .Values.config.spanCompression.compressionWindowSecs | default 60 }}
+                max_span_duration_secs: {{ .Values.config.spanCompression.maxSpanDurationSecs | default 60 }}
+              {{- if .Values.oidc.enabled }}
+
+              oidc:
+                enabled: true
+                issuer_url: {{ .Values.oidc.issuerUrl | quote }}
+                client_id: {{ .Values.oidc.clientId | quote }}
+                audience: {{ .Values.oidc.audience | default "" | quote }}
+                required_scopes:
+                {{- range .Values.oidc.requiredScopes }}
+                  - {{ . | quote }}
+                {{- end }}
+                {{- if .Values.oidc.requiredRoles }}
+                required_roles:
+                {{- range .Values.oidc.requiredRoles }}
+                  - {{ . | quote }}
+                {{- end }}
+                {{- end }}
+                roles_claim: {{ .Values.oidc.rolesClaim | default "roles" | quote }}
+                jwks_cache_secs: {{ .Values.oidc.jwksCacheSecs | default 300 }}
+              {{- end }}
+              EOF
+
+              exec /app/tail-sampling-selector
+          {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

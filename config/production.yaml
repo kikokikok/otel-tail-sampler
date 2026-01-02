@@ -1,0 +1,75 @@
+app:
+  instance_id: "tss-prod-001"
+  max_buffer_spans: 2000000
+  max_buffer_traces: 200000
+  evaluation_interval_secs: 1
+  shutdown_timeout_secs: 60
+  evaluation_workers: 8
+  graceful_shutdown: true
+
+kafka:
+  brokers: "kafka:29092"
+  input_topic: "otel-traces-raw"
+  consumer_group: "tail-sampling-selector-prod"
+  consumer_threads: 4
+  auto_offset_reset: "earliest"
+  enable_auto_commit: false
+  session_timeout_ms: 45000
+  sasl_mechanism: null
+  sasl_username: null
+  sasl_password: null
+  ssl_ca_path: null
+  ssl_cert_path: null
+  ssl_key_path: null
+
+redis:
+  url: "redis://redis:6379"
+  password: null
+  db: 0
+  pool_size: 20
+  connection_timeout_secs: 10
+  trace_ttl_secs: 60
+  cluster_enabled: false
+  cluster_nodes: null
+
+datadog:
+  api_endpoint: "https://api.datadoghq.com"
+  api_key: null
+  application_key: null
+  batch_enabled: true
+  batch_size: 200
+  batch_timeout_secs: 5
+  request_timeout_secs: 30
+  max_retries: 5
+  retry_initial_delay_ms: 1000
+
+sampling:
+  decision_wait_secs: 30
+  num_traces: 50000
+  expected_new_traces_per_sec: 1000
+  sample_errors: true
+  error_sample_rate: 1.0
+  sample_latency: true
+  latency_threshold_ms: 5000
+  latency_sample_rate: 0.1
+  sample_cardinality: true
+  max_span_count: 500
+  policy_cleanup_interval_secs: 60
+
+observability:
+  log_level: "info"
+  json_logging: true
+  enable_prometheus: true
+  metrics_port: 9090
+  metrics_addr: "0.0.0.0"
+  enable_health_check: true
+  health_port: 8080
+  health_addr: "0.0.0.0"
+  enable_otel_tracing: false
+  otel_endpoint: null
+  service_name: "tail-sampling-selector"
+  otel_sample_rate: 0.1
+
+storage:
+  storage_type: "memory"
+  iceberg: null

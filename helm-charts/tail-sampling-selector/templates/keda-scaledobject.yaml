@@ -1,0 +1,38 @@
+{{- if .Values.keda.enabled -}}
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: {{ .Values.keda.scaledObjectName | default (include "tail-sampling-selector.fullname" .) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "tail-sampling-selector.labels" . | nindent 4 }}
+spec:
+  scaleTargetRef:
+    name: {{ include "tail-sampling-selector.fullname" . }}
+  pollingInterval: {{ .Values.keda.pollingInterval | default 15 }}
+  cooldownPeriod: {{ .Values.keda.cooldownPeriod | default 300 }}
+  minReplicaCount: {{ .Values.keda.minReplicaCount | default 1 }}
+  maxReplicaCount: {{ .Values.keda.maxReplicaCount | default 10 }}
+  {{- with .Values.keda.fallback }}
+  fallback:
+    failureThreshold: {{ .failureThreshold | default 3 }}
+    replicas: {{ .replicas | default 2 }}
+  {{- end }}
+  {{- if .Values.keda.kafka }}
+  triggers:
+    - type: kafka
+      metadata:
+        bootstrapServers: {{ .Values.keda.kafka.brokers | quote }}
+        consumerGroup: {{ .Values.keda.kafka.consumerGroup | quote }}
+        topic: {{ .Values.keda.kafka.topic | quote }}
+        offsetResetPolicy: {{ .Values.keda.kafka.offsetReset | default "latest" | lower | quote }}
+        lagThreshold: {{ .Values.keda.kafka.lagThreshold | default "100" | quote }}
+        scope: {{ .Values.keda.kafka.scope | default "consumergroup" | lower | quote }}
+        {{- if .Values.keda.kafka.sasl }}
+        sasl: {{ .Values.keda.kafka.sasl | quote }}
+        {{- end }}
+        {{- if .Values.keda.kafka.tls }}
+        tls: {{ .Values.keda.kafka.tls | quote }}
+        {{- end }}
+  {{- end }}
+{{- end }}

@@ -1,0 +1,17 @@
+apiVersion: v2
+name: tail-sampling-selector
+description: A production-ready, Rust-based tail sampling selector for distributed tracing pipelines
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - tracing
+  - tail-sampling
+  - distributed-tracing
+  - opentelemetry
+  - datadog
+home: https://github.com/your-org/tail-sampling-selector
+icon: https://opentelemetry.io/img/logos/opentelemetry-horizontal-default.svg
+maintainers:
+  - name: Engineering Team
+    email: engineering@your-org.com
