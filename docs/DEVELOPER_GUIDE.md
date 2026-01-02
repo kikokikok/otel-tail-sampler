@@ -295,7 +295,167 @@ fn create_exporter(config: &ExporterConfigs) -> Arc<dyn SpanExporter> {
 
 ### Overview
 
-The span compression feature can be extended with custom grouping strategies, new pattern types, and additional statistics.
+The span compression feature groups repeated similar operations (SQL queries, HTTP calls, etc.) into single aggregated spans with statistics. This section covers how to extend it with custom grouping strategies, patterns, and statistics.
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                     Span Compression Pipeline                    │
+├─────────────────────────────────────────────────────────────────┤
+│                                                                  │
+│   BufferedSpan[]                                                │
+│        │                                                         │
+│        ▼                                                         │
+│   ┌──────────────┐                                              │
+│   │ SpanGrouper  │  ← Extracts group key per span               │
+│   │              │    (trace_id + service + normalized_stmt)    │
+│   └──────┬───────┘                                              │
+│          │                                                       │
+│          ▼                                                       │
+│   ┌──────────────────┐                                          │
+│   │ group_spans()    │  ← Groups spans by key                   │
+│   └──────┬───────────┘                                          │
+│          │                                                       │
+│          ▼                                                       │
+│   ┌────────────────────────┐                                    │
+│   │ filter_compressible()  │  ← Filters by min_count & window   │
+│   └──────┬─────────────────┘                                    │
+│          │                                                       │
+│          ▼                                                       │
+│   ┌──────────────────┐     ┌─────────────────────┐              │
+│   │ compress_groups()│────▶│ CompressedSpan[]    │              │
+│   └──────────────────┘     │ (with statistics)   │              │
+│                            └─────────────────────┘              │
+│                                      +                           │
+│                            ┌─────────────────────┐              │
+│                            │ Uncompressed spans  │              │
+│                            │ (didn't meet criteria)│            │
+│                            └─────────────────────┘              │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Key Types
+
+```rust
+/// Grouping key for similar spans
+pub struct SpanGroupKey {
+    pub trace_id: String,
+    pub service_name: String,
+    pub operation_type: String,        // e.g., "db.postgresql.select"
+    pub normalized_statement: String,  // e.g., "SELECT * FROM USERS WHERE ID = ?"
+    pub parent_span_id: Option<String>,
+}
+
+/// Aggregated span representing multiple similar operations
+pub struct CompressedSpan {
+    pub trace_id: String,
+    pub span_id: String,              // Generated unique ID
+    pub timestamp_ms: i64,            // First span timestamp
+    pub last_timestamp_ms: i64,       // Last span timestamp
+    pub total_duration_ms: i64,       // Sum of all durations
+    pub span_count: usize,            // Number of original spans
+    pub error_count: usize,           // Spans with errors
+    pub mean_duration_ms: f64,
+    pub min_duration_ms: i64,
+    pub max_duration_ms: i64,
+    pub operation_name: String,
+    pub service_name: String,
+    pub parent_span_id: Option<String>,
+    pub attributes: HashMap<String, String>,
+    pub group_signature: String,      // Normalized statement
+    pub original_span_ids: Vec<String>,
+}
+```
+
+### Configuration Reference
+
+```yaml
+span_compression:
+  # Master switch
+  enabled: true
+  
+  # Minimum spans to trigger compression
+  # Lower = more aggressive compression, Higher = preserve more detail
+  min_compression_count: 3
+  
+  # Time window for grouping (seconds)
+  # Spans outside this window won't be grouped together
+  compression_window_secs: 60
+  
+  # Never compress spans longer than this (seconds)
+  # Ensures long-running operations are always visible individually
+  max_span_duration_secs: 60
+  
+  # Whitelist: only compress these operations (empty = all)
+  compress_operations:
+    - "postgresql"
+    - "mysql"
+    - "redis"
+  
+  # Blacklist: never compress these operations
+  exclude_operations:
+    - "authentication.verify"
+    - "payment.process"
+    - "order.create"
+  
+  # Custom SQL patterns for specialized grouping
+  sql_patterns:
+    - pattern: "SELECT .* FROM users WHERE"
+      is_regex: true
+      group_name: "users.lookup"
+    
+    - pattern: "INSERT INTO audit_log"
+      is_regex: false
+      group_name: "audit.write"
+    
+    - pattern: "UPDATE inventory SET quantity"
+      is_regex: false
+      group_name: "inventory.update"
+```
+
+### Example: Real-World SQL Compression
+
+**Input: E-commerce checkout trace (47 spans)**
+
+```
+Trace: checkout-12345
+├── HTTP POST /api/v1/checkout                    (250ms)
+├── postgresql.query: SELECT * FROM users WHERE id = 789
+├── postgresql.query: SELECT * FROM users WHERE id = 790  
+├── postgresql.query: SELECT * FROM users WHERE id = 791
+│   ... (15 more user lookups)
+├── postgresql.query: SELECT * FROM products WHERE id = 101
+├── postgresql.query: SELECT * FROM products WHERE id = 102
+│   ... (8 more product lookups)
+├── postgresql.query: SELECT * FROM inventory WHERE product_id = 101
+├── postgresql.query: SELECT * FROM inventory WHERE product_id = 102
+│   ... (8 more inventory checks)
+├── redis.get: cart:user:789
+├── redis.get: cart:user:790
+│   ... (5 more cache lookups)
+├── payment.process                                (1200ms) ← excluded
+└── order.create                                   (45ms)   ← excluded
+```
+
+**Output: Compressed trace (8 spans)**
+
+```
+Trace: checkout-12345
+├── HTTP POST /api/v1/checkout                    (250ms)
+├── postgresql.query (aggregated): SELECT * FROM USERS WHERE ID = ?
+│   └── count: 18, total: 54ms, mean: 3ms, min: 1ms, max: 8ms
+├── postgresql.query (aggregated): SELECT * FROM PRODUCTS WHERE ID = ?
+│   └── count: 10, total: 25ms, mean: 2.5ms, min: 1ms, max: 5ms
+├── postgresql.query (aggregated): SELECT * FROM INVENTORY WHERE PRODUCT_ID = ?
+│   └── count: 10, total: 30ms, mean: 3ms, min: 2ms, max: 6ms
+├── redis.get (aggregated): cart:user:*
+│   └── count: 7, total: 7ms, mean: 1ms, min: 0ms, max: 2ms
+├── payment.process                                (1200ms) ← preserved
+└── order.create                                   (45ms)   ← preserved
+```
+
+**Result**: 47 spans → 8 spans (83% reduction)
 
 ### Adding Custom Grouping Keys
 
@@ -317,7 +477,7 @@ pub struct ExtendedSpanGroupKey {
 
 ### Adding Custom Pattern Matchers
 
-Create a new pattern matcher:
+Create a new pattern matcher for specialized operations:
 
 ```rust
 /// Custom matcher for gRPC operations
@@ -330,66 +490,226 @@ pub struct GrpcPatternMatcher {
 
 impl GrpcPatternMatcher {
     pub fn matches(&self, span: &BufferedSpan) -> bool {
-        // Check if operation matches gRPC pattern
-        span.operation_name.starts_with(&format("/{}/{}", self.package, self.service))
+        // Check if operation matches gRPC pattern: /package.Service/Method
+        span.operation_name.starts_with(&format!("/{}.{}/", self.package, self.service))
+    }
+    
+    pub fn normalize(&self, span: &BufferedSpan) -> String {
+        // Extract method and normalize: /com.example.UserService/GetUser → GetUser
+        span.operation_name
+            .split('/')
+            .last()
+            .unwrap_or(&span.operation_name)
+            .to_string()
+    }
+}
+
+/// Custom matcher for HTTP endpoints with path parameters
+pub struct HttpPatternMatcher;
+
+impl HttpPatternMatcher {
+    pub fn normalize(path: &str) -> String {
+        // /api/v1/users/123/orders/456 → /api/v1/users/:id/orders/:id
+        let re = regex::Regex::new(r"/\d+").unwrap();
+        re.replace_all(path, "/:id").to_string()
     }
 }
 ```
 
-### Adding Compression Statistics
+### Adding Compression Statistics (Percentiles)
 
-Extend `CompressedSpan`:
+Extend `CompressedSpan` with percentile calculations:
 
 ```rust
 pub struct CompressedSpan {
     // ... existing fields
-    pub p50_duration_ms: f64,    // NEW: 50th percentile
-    pub p95_duration_ms: f64,    // NEW: 95th percentile
-    pub p99_duration_ms: f64,    // NEW: 99th percentile
+    
+    // NEW: Percentile statistics
+    pub p50_duration_ms: f64,
+    pub p95_duration_ms: f64,
+    pub p99_duration_ms: f64,
+    pub stddev_duration_ms: f64,
 }
-```
 
-Calculate in `from_spans()`:
-
-```rust
 impl CompressedSpan {
-    pub fn from_spans(...) -> Self {
+    pub fn from_spans(
+        trace_id: String,
+        span_id: String,
+        parent_span_id: Option<String>,
+        service_name: String,
+        group_signature: String,
+        spans: &[BufferedSpan],
+    ) -> Self {
         // ... existing code
-
+        
         // Calculate percentiles
         let mut durations: Vec<i64> = spans.iter().map(|s| s.duration_ms).collect();
         durations.sort();
-        let p50 = durations[durations.len() / 2];
-        let p95 = durations[(durations.len() * 95) / 100];
-        let p99 = durations[(durations.len() * 99) / 100];
-
+        
+        let len = durations.len();
+        let p50 = if len > 0 { durations[len / 2] } else { 0 };
+        let p95 = if len > 0 { durations[(len * 95) / 100] } else { 0 };
+        let p99 = if len > 0 { durations[(len * 99) / 100] } else { 0 };
+        
+        // Calculate standard deviation
+        let mean = total_duration as f64 / len as f64;
+        let variance = durations.iter()
+            .map(|&d| (d as f64 - mean).powi(2))
+            .sum::<f64>() / len as f64;
+        let stddev = variance.sqrt();
+        
         Self {
             // ... existing fields
             p50_duration_ms: p50 as f64,
             p95_duration_ms: p95 as f64,
             p99_duration_ms: p99 as f64,
+            stddev_duration_ms: stddev,
         }
     }
 }
 ```
 
-### Custom Datadog Output Format
+### Extending Datadog Output
 
-The compressed span conversion in `src/datadog/client.rs` can be extended:
+Add percentile metrics to the Datadog span conversion in `src/datadog/client.rs`:
 
 ```rust
 impl From<&CompressedSpan> for DatadogSpan {
     fn from(compressed: &CompressedSpan) -> Self {
-        // ... existing code
+        // ... existing conversion code
+        
+        // Add percentile tags
+        additional.insert("compression.p50_ms".to_string(), 
+                          format!("{:.2}", compressed.p50_duration_ms));
+        additional.insert("compression.p95_ms".to_string(), 
+                          format!("{:.2}", compressed.p95_duration_ms));
+        additional.insert("compression.p99_ms".to_string(), 
+                          format!("{:.2}", compressed.p99_duration_ms));
+        additional.insert("compression.stddev_ms".to_string(), 
+                          format!("{:.2}", compressed.stddev_duration_ms));
+        
+        // ... rest of conversion
+    }
+}
+```
 
-        // Add percentile metrics
-        if let Some(ref mut metrics) = self.metrics.additional {
-            metrics.insert("compression.p50_ms".to_string(), compressed.p50_duration_ms);
-            metrics.insert("compression.p95_ms".to_string(), compressed.p95_duration_ms);
-            metrics.insert("compression.p99_ms".to_string(), compressed.p99_duration_ms);
+### Testing Span Compression
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+    
+    fn create_sql_span(trace_id: &str, query: &str, duration_ms: i64) -> BufferedSpan {
+        let mut attributes = HashMap::new();
+        attributes.insert("db.system".to_string(), "postgresql".to_string());
+        attributes.insert("db.statement".to_string(), query.to_string());
+        
+        BufferedSpan {
+            trace_id: trace_id.to_string(),
+            span_id: uuid::Uuid::new_v4().to_string(),
+            parent_span_id: None,
+            timestamp_ms: 1000,
+            duration_ms,
+            status_code: 0,
+            span_kind: SpanKind::Client,
+            service_name: "order-service".to_string(),
+            operation_name: "postgresql.query".to_string(),
+            attributes,
         }
-
-        self
+    }
+    
+    #[test]
+    fn test_sql_queries_grouped_correctly() {
+        let config = Arc::new(SpanCompressionConfig {
+            enabled: true,
+            min_compression_count: 2,
+            compression_window_secs: 60,
+            max_span_duration_secs: 60,
+            compress_operations: vec![],
+            exclude_operations: vec![],
+            sql_patterns: vec![],
+        });
+        
+        let grouper = SpanGrouper::new(config);
+        
+        // Create similar SQL queries with different parameter values
+        let spans = vec![
+            create_sql_span("trace-1", "SELECT * FROM users WHERE id = 123", 5),
+            create_sql_span("trace-1", "SELECT * FROM users WHERE id = 456", 3),
+            create_sql_span("trace-1", "SELECT * FROM users WHERE id = 789", 4),
+            create_sql_span("trace-1", "INSERT INTO logs VALUES ('test')", 2),
+        ];
+        
+        let (compressed, uncompressed) = process_spans_for_compression(&spans, &grouper);
+        
+        // SELECT queries should be compressed (3 spans → 1)
+        assert_eq!(compressed.len(), 1);
+        assert_eq!(compressed[0].span_count, 3);
+        assert_eq!(compressed[0].total_duration_ms, 12); // 5 + 3 + 4
+        
+        // INSERT query should remain uncompressed (only 1 span)
+        assert_eq!(uncompressed.len(), 1);
+    }
+    
+    #[test]
+    fn test_long_spans_never_compressed() {
+        let config = Arc::new(SpanCompressionConfig {
+            enabled: true,
+            min_compression_count: 2,
+            compression_window_secs: 60,
+            max_span_duration_secs: 5, // 5 second limit
+            compress_operations: vec![],
+            exclude_operations: vec![],
+            sql_patterns: vec![],
+        });
+        
+        let grouper = SpanGrouper::new(config);
+        
+        let spans = vec![
+            create_sql_span("trace-1", "SELECT * FROM users", 3000),  // 3s - under limit
+            create_sql_span("trace-1", "SELECT * FROM users", 6000),  // 6s - OVER limit
+            create_sql_span("trace-1", "SELECT * FROM users", 4000),  // 4s - under limit
+        ];
+        
+        let (compressed, uncompressed) = process_spans_for_compression(&spans, &grouper);
+        
+        // Only 2 spans should be compressed (the ones under 5s)
+        assert_eq!(compressed.len(), 1);
+        assert_eq!(compressed[0].span_count, 2);
+        
+        // The 6s span should remain uncompressed
+        assert_eq!(uncompressed.len(), 1);
+        assert_eq!(uncompressed[0].duration_ms, 6000);
+    }
+    
+    #[test]
+    fn test_excluded_operations_never_compressed() {
+        let config = Arc::new(SpanCompressionConfig {
+            enabled: true,
+            min_compression_count: 2,
+            compression_window_secs: 60,
+            max_span_duration_secs: 60,
+            compress_operations: vec![],
+            exclude_operations: vec!["payment.process".to_string()],
+            sql_patterns: vec![],
+        });
+        
+        let grouper = SpanGrouper::new(config);
+        
+        // Even with 5 identical payment spans, they should NOT be compressed
+        let mut spans = Vec::new();
+        for _ in 0..5 {
+            let mut span = create_sql_span("trace-1", "charge card", 100);
+            span.operation_name = "payment.process".to_string();
+            spans.push(span);
+        }
+        
+        let (compressed, uncompressed) = process_spans_for_compression(&spans, &grouper);
+        
+        // Nothing should be compressed
+        assert_eq!(compressed.len(), 0);
+        assert_eq!(uncompressed.len(), 5);
     }
 }
 ```

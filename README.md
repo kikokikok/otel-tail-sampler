@@ -191,6 +191,115 @@ sampling:
   max_span_count: 500
 ```
 
+## Span Compression
+
+Span compression reduces trace volume by aggregating similar repeated operations (like SQL queries or API calls) into single summary spans with statistics. This is especially useful for:
+
+- **Database-heavy traces**: Hundreds of similar `SELECT` queries compressed into one span
+- **Batch processing**: Repeated operations grouped with count/duration statistics  
+- **Cost reduction**: Fewer spans exported to Datadog = lower costs
+
+### How It Works
+
+```
+Before compression (10 spans):
+├── SELECT * FROM users WHERE id = 1     (5ms)
+├── SELECT * FROM users WHERE id = 2     (3ms)
+├── SELECT * FROM users WHERE id = 3     (4ms)
+├── SELECT * FROM users WHERE id = 4     (6ms)
+├── SELECT * FROM users WHERE id = 5     (5ms)
+├── INSERT INTO audit_log VALUES (...)   (2ms)
+├── INSERT INTO audit_log VALUES (...)   (3ms)
+├── INSERT INTO audit_log VALUES (...)   (2ms)
+├── HTTP GET /api/health                 (1ms)
+└── HTTP GET /api/health                 (1ms)
+
+After compression (4 spans):
+├── SELECT * FROM users WHERE id = ? (aggregated)
+│   └── count: 5, total: 23ms, mean: 4.6ms, min: 3ms, max: 6ms
+├── INSERT INTO audit_log VALUES (?) (aggregated)  
+│   └── count: 3, total: 7ms, mean: 2.3ms, min: 2ms, max: 3ms
+├── HTTP GET /api/health                 (1ms)  ← below min_compression_count
+└── HTTP GET /api/health                 (1ms)  ← below min_compression_count
+```
+
+### Configuration
+
+```yaml
+span_compression:
+  # Enable span compression
+  enabled: true
+  
+  # Minimum spans needed to trigger compression (default: 3)
+  min_compression_count: 3
+  
+  # Time window for grouping spans (default: 60 seconds)
+  compression_window_secs: 60
+  
+  # Never compress spans longer than this (default: 60 seconds)
+  # Long-running operations are always preserved individually
+  max_span_duration_secs: 60
+  
+  # Only compress these operations (empty = all eligible)
+  compress_operations: []
+  
+  # Never compress these operations
+  exclude_operations:
+    - "authentication.verify"
+    - "payment.process"
+  
+  # Custom SQL grouping patterns
+  sql_patterns:
+    - pattern: "SELECT .* FROM users"
+      is_regex: true
+      group_name: "users.select"
+    - pattern: "INSERT INTO audit"
+      is_regex: false
+      group_name: "audit.insert"
+```
+
+### Compression Output in Datadog
+
+Compressed spans appear in Datadog with aggregated metadata:
+
+| Tag | Description | Example |
+|-----|-------------|---------|
+| `compression.type` | Always "aggregated" | `aggregated` |
+| `compression.count` | Number of original spans | `47` |
+| `compression.total_duration_ms` | Sum of all durations | `1250` |
+| `compression.mean_duration_ms` | Average duration | `26.6` |
+| `compression.min_duration_ms` | Fastest span | `5` |
+| `compression.max_duration_ms` | Slowest span | `89` |
+| `compression.group_signature` | Normalized operation | `SELECT * FROM users WHERE id = ?` |
+
+### SQL Normalization
+
+SQL statements are automatically normalized for grouping:
+
+| Original | Normalized |
+|----------|------------|
+| `SELECT * FROM users WHERE id = 123` | `SELECT * FROM USERS WHERE ID = ?` |
+| `INSERT INTO logs VALUES ('error', 1699999)` | `INSERT INTO LOGS VALUES (?, ?)` |
+| `UPDATE orders SET status = 'shipped' WHERE id = 456` | `UPDATE ORDERS SET STATUS = ? WHERE ID = ?` |
+
+### Memory Impact
+
+Span compression significantly reduces memory usage for SQL-heavy traces:
+
+| Scenario | Without Compression | With Compression | Reduction |
+|----------|---------------------|------------------|-----------|
+| 1000 similar queries | ~1MB | ~50KB | 95% |
+| ETL batch (10K ops) | ~10MB | ~200KB | 98% |
+| Mixed workload | ~500KB | ~300KB | 40% |
+
+### Metrics
+
+| Metric | Description |
+|--------|-------------|
+| `tail_sampling_spans_compressed_total` | Total spans compressed |
+| `tail_sampling_compression_groups_total` | Number of compression groups created |
+| `tail_sampling_compression_ratio` | Ratio of original to compressed spans |
+
 ## Dynamic Force Sampling
 
 Force sampling allows runtime override of sampling decisions for debugging purposes. Rules are stored in Redis with automatic expiration and evaluated before regular policies.
