@@ -1,13 +1,16 @@
-# Tail-Sampling Selector V2: Iceberg Architecture (Lakekeeper + Garage)
+# Tail-Sampling Selector V2: Iceberg Architecture (AutoMQ Table Topic)
 
 ## Executive Summary
 
-This document describes the next-generation architecture for the tail-sampling selector, replacing in-memory trace buffering with Iceberg-based storage via **Lakekeeper** (REST catalog) and **Garage** (S3-compatible storage). This approach reduces memory consumption by **50-250x** while enabling predicate pushdown for efficient sampling decisions.
+This document describes the production architecture for the tail-sampling selector using **AutoMQ Table Topic** for native Kafka→Iceberg streaming. The application is **read-only** from Iceberg - AutoMQ handles all data ingestion automatically.
+
+**Key insight**: AutoMQ Table Topic eliminates the need for application-level Iceberg writes. Data flows automatically from Kafka to Iceberg, and our app simply queries for sampling decisions.
 
 **Target Environment**: 
-- **Lakekeeper**: Apache Iceberg REST Catalog (Rust-based, running in k3s)
-- **Garage**: S3-compatible object storage (running in k3s)
-- **Production**: Databricks (same Iceberg format)
+- **AutoMQ**: Kafka-compatible broker with native Table Topic support
+- **Lakekeeper**: Apache Iceberg REST Catalog (Rust-based)
+- **MinIO/Garage/S3**: Object storage for Iceberg data files
+- **Production**: Databricks Unity Catalog (same Iceberg format)
 
 ## Problem Statement
 
@@ -28,28 +31,24 @@ The current design loads every span into a `HashMap<trace_id, Vec<BufferedSpan>>
 
 **This is fundamentally inefficient** - we're storing ~800-1200 bytes per span when sampling decisions only need ~50 bytes of metadata.
 
-## Solution: AutoMQ + Iceberg (Lakekeeper + Garage)
+## Solution: AutoMQ Table Topic + Iceberg
 
-### New Architecture
+### Architecture Overview
 
 ```
-┌──────────────┐    ┌─────────────────┐    ┌──────────────────┐
-│ OTEL         │───▶│ AutoMQ          │───▶│ Iceberg Table    │
-│ Collectors   │    │ (S3 WAL)        │    │ on Garage (S3)   │
-└──────────────┘    └─────────────────┘    └────────┬─────────┘
-                                                    │
-                    ┌───────────────────────────────┘
-                    │ Zero-ETL: AutoMQ Table Topic
-                    │ auto-materializes to Iceberg
+┌──────────────┐    ┌─────────────────────┐    ┌──────────────────┐
+│ OTEL         │───▶│ AutoMQ Kafka        │───▶│ Iceberg Table    │
+│ Collectors   │    │ (Table Topic)       │    │ on S3/MinIO      │
+└──────────────┘    └─────────────────────┘    └────────┬─────────┘
+                                                        │
+                    ┌───────────────────────────────────┘
+                    │ READ-ONLY: App queries Iceberg
+                    │ (AutoMQ handles all writes)
                     │
           ┌────────▼─────────┐    ┌──────────────────┐
-          │ iceberg-rust     │───▶│ Lakekeeper       │
-          │ + DataFusion     │    │ (REST Catalog)   │
-          └────────┬─────────┘    └──────────────────┘
-                   │
-          ┌────────▼─────────┐
-          │ Tail-Sampling    │  ← Memory: ~100MB vs 25GB
-          │ Selector         │    Predicate pushdown!
+          │ Tail-Sampling    │───▶│ Lakekeeper       │
+          │ Selector         │    │ (REST Catalog)   │
+          │ (iceberg-rust)   │    └──────────────────┘
           └────────┬─────────┘
                    │
    ┌───────────────┴───────────────┐
@@ -57,9 +56,11 @@ The current design loads every span into a `HashMap<trace_id, Vec<BufferedSpan>>
    ▼                               ▼
 ┌──────────────┐          ┌──────────────┐
 │ Redis        │          │ Datadog      │
-│ (Force Rules)│          │ (Export)     │
+│ (Dedup/TTL)  │          │ (Export)     │
 └──────────────┘          └──────────────┘
 ```
+
+**Critical difference from V1**: The application does NOT write to Iceberg. AutoMQ Table Topic streams Kafka messages directly to Iceberg tables at the broker level.
 
 ### Your K3s Infrastructure
 
@@ -117,31 +118,33 @@ Production (Databricks):
 ### Step 1: Ingest (OTEL → AutoMQ)
 ```
 OTEL Collector produces OTLP spans to AutoMQ topic: otel-traces-raw
+(Standard Kafka producer - no changes needed)
 ```
 
-### Step 2: Materialize (AutoMQ → Iceberg)
-AutoMQ Table Topic automatically:
-- Parses spans (Protobuf/Avro via Schema Registry)
+### Step 2: Materialize (AutoMQ → Iceberg) - AUTOMATIC
+AutoMQ Table Topic **automatically** (no application code):
+- Receives Kafka messages from topic
+- Parses spans based on configured schema
 - Writes to Iceberg table on S3
 - Commits every `commit.interval.ms` (default: 60s)
 
-### Step 3: Query (DataFusion → Iceberg)
+**This is the key innovation**: Zero application code for Kafka→Iceberg streaming.
+
+### Step 3: Query (Tail-Sampling Selector → Iceberg) - READ-ONLY
 ```sql
 -- Find traces ready for sampling evaluation
--- Only reads trace_id, status_code, duration_ms, timestamp columns
--- Parquet row group pruning based on timestamp
-
+-- Application queries Iceberg via REST catalog
 SELECT 
     trace_id,
-    MAX(status_code = 2) as has_error,
+    MAX(CASE WHEN status_code = 2 THEN 1 ELSE 0 END) as has_error,
     MAX(duration_ms) as max_duration,
     COUNT(*) as span_count,
     MIN(timestamp_ms) as first_seen,
     MAX(timestamp_ms) as last_seen
 FROM otel_spans
-WHERE timestamp_ms > NOW() - INTERVAL '5 minutes'
+WHERE timestamp_ms > NOW() - INTERVAL '1 hour'
 GROUP BY trace_id
-HAVING last_seen < NOW() - INTERVAL '60 seconds'  -- Inactive traces
+HAVING last_seen < NOW() - INTERVAL '5 minutes'  -- Inactive traces
 ```
 
 ### Step 4: Sample Decision
@@ -256,80 +259,51 @@ AWS_REGION: garage
 AWS_S3_ALLOW_UNSAFE_RENAME: true
 ```
 
-### AutoMQ Server Configuration
-```properties
-# S3 WAL mode (fully S3-native) - uses Garage
-automq.wal.backend=s3
+### AutoMQ Table Topic Configuration (docker-compose.yml)
 
-# Object storage (Garage)
-s3.endpoint=http://garage.storage.svc.cluster.local:3900
-s3.bucket=automq-data
-s3.region=garage
-s3.path.style.access=true
-s3.access.key=<garage-access-key>
-s3.secret.key=<garage-secret-key>
-
-# Table Topic (Iceberg via Lakekeeper)
-automq.table.topic.enable=true
-automq.table.topic.catalog.type=rest
-automq.table.topic.catalog.uri=http://lakekeeper.observability.svc.cluster.local:8181
-automq.table.topic.catalog.warehouse=s3://iceberg-warehouse/
+**Cluster-level settings** (in kafka service command):
+```bash
+--override automq.table.topic.catalog.type=rest
+--override automq.table.topic.catalog.uri=http://lakekeeper:8181/catalog
+--override automq.table.topic.catalog.warehouse=s3://iceberg-warehouse/traces/
 ```
 
-### Topic Configuration (otel-traces-raw)
-```properties
-# Enable Table Topic
-automq.table.topic.enable=true
-automq.table.topic.namespace=observability
-
-# Schema handling
-automq.table.topic.convert.value.type=by_schema_id
-automq.table.topic.transform.value.type=flatten
-
-# Commit interval (affects latency vs. S3 PUT costs)
-automq.table.topic.commit.interval.ms=60000
-
-# Partitioning for optimal query performance
-automq.table.topic.partition.by=[day(timestamp_ms), bucket(trace_id, 16)]
+**Topic-level settings** (in kafka-init service):
+```bash
+kafka-topics.sh --create --topic otel-traces-raw \
+  --partitions 3 --replication-factor 1 \
+  --config automq.table.topic.enable=true \
+  --config automq.table.topic.namespace=default \
+  --config automq.table.topic.convert.value.type=raw \
+  --config automq.table.topic.transform.value.type=none \
+  --config automq.table.topic.commit.interval.ms=60000
 ```
 
-### Tail-Sampling Selector Configuration
+### Tail-Sampling Selector Configuration (config/default.yaml)
+
 ```yaml
-# New iceberg-based storage
+# Storage backend selection
 storage:
-  type: iceberg
-  catalog:
-    type: rest
-    uri: http://lakekeeper.observability.svc.cluster.local:8181
-    # Warehouse path on Garage S3
-    warehouse: s3://iceberg-warehouse/
-  s3:
-    endpoint: http://garage.storage.svc.cluster.local:3900
-    region: garage
-    path_style_access: true
-    access_key_id: ${GARAGE_ACCESS_KEY}
-    secret_access_key: ${GARAGE_SECRET_KEY}
-  table:
-    namespace: observability
-    name: otel_spans
+  storage_type: "iceberg"  # or "memory" for traditional mode
+  iceberg:
+    catalog_uri: "http://lakekeeper:8181/catalog"
+    warehouse: "s3://iceberg-warehouse/traces/"
+    namespace: "default"
+    table_name: "otel_traces"
+    s3_endpoint: "http://minio:9000"
+    s3_access_key_id: "admin"
+    s3_secret_access_key: "password"
+    s3_region: "us-east-1"
+    s3_path_style: true
 
-# Query settings
-query:
-  # How often to scan for ready traces
-  scan_interval_secs: 10
-  # Trace considered "complete" after this inactivity
-  inactivity_threshold_secs: 60
-  # Maximum trace age before force evaluation
-  max_trace_age_secs: 3600
-  # Batch size for sampling evaluation
-  batch_size: 1000
+# Long-running trace support
+app:
+  inactivity_timeout_secs: 300   # 5 minutes between spans
+  max_trace_duration_secs: 3600  # 1 hour max trace duration
 
-# Sampling policies (unchanged)
-sampling:
-  sample_errors: true
-  error_sample_rate: 1.0
-  sample_latency: true
-  latency_threshold_ms: 30000
+# Redis deduplication (TTL > max_trace_duration)
+redis:
+  trace_ttl_secs: 7200  # 2 hours
 ```
 
 ### Databricks Production Configuration
@@ -346,30 +320,30 @@ storage:
     name: otel_spans
 ```
 
-## Implementation Phases
+## Implementation Status
 
-### Phase 1: Infrastructure Setup (Week 1)
-- [ ] Create docker-compose with AutoMQ + MinIO + Iceberg REST catalog
-- [ ] Configure Table Topic for OTEL spans
-- [ ] Verify Iceberg table creation and data flow
+### Phase 1: Infrastructure Setup - COMPLETE
+- [x] docker-compose with AutoMQ + MinIO + Lakekeeper
+- [x] AutoMQ Table Topic configuration (cluster + topic level)
+- [x] Iceberg table creation via Lakekeeper REST catalog
 
-### Phase 2: Query Layer (Week 2)
-- [ ] Add `datafusion` and `iceberg-rust` dependencies
-- [ ] Implement `IcebergTraceStore` trait
-- [ ] Build sampling query with predicate pushdown
-- [ ] Add trace metadata caching
+### Phase 2: Query Layer - COMPLETE
+- [x] `iceberg-rust` and `datafusion` dependencies
+- [x] `IcebergTraceStore` implementation (read-only)
+- [x] Sampling query with predicate pushdown
+- [x] Trace metadata caching
 
-### Phase 3: Refactor Sampling Selector (Week 3)
-- [ ] Replace `TraceBuffer` with `IcebergTraceStore`
-- [ ] Implement lazy span loading for export
-- [ ] Update evaluation workers for Iceberg queries
-- [ ] Add metrics for query performance
+### Phase 3: Read-Only Refactor - COMPLETE
+- [x] Removed write logic from `IcebergTraceStore` (AutoMQ handles writes)
+- [x] Updated `ingest()` to log warning (no-op for Iceberg mode)
+- [x] Long-running trace support (1hr max duration, 5min inactivity)
+- [x] Fixed max_trace_duration detection bug
 
-### Phase 4: Testing & Optimization (Week 4)
+### Phase 4: Testing & Documentation - IN PROGRESS
+- [x] Memory mode continues to work unchanged
 - [ ] Load testing with realistic trace volumes
-- [ ] Memory profiling comparison
-- [ ] Query optimization (partition pruning, caching)
-- [ ] Documentation and migration guide
+- [ ] Production deployment guide
+- [ ] Monitoring and alerting setup
 
 ## Dependencies to Add
 

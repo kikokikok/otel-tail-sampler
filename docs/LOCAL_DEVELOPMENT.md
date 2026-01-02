@@ -2,6 +2,17 @@
 
 This guide covers setting up the full Iceberg-based stack locally for development.
 
+## Storage Modes
+
+The application supports two storage modes:
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `memory` | In-memory trace buffer | Development, small scale |
+| `iceberg` | Query Iceberg via Lakekeeper | Production, long-running traces |
+
+**Important**: In Iceberg mode, the application is **read-only**. AutoMQ Table Topic handles all Kafka→Iceberg writes automatically.
+
 ## Stack Components
 
 | Component | Image | Port | Purpose |
@@ -9,8 +20,8 @@ This guide covers setting up the full Iceberg-based stack locally for developmen
 | MinIO | `minio/minio:latest` | 9000, 9001 | S3-compatible object storage |
 | PostgreSQL | `postgres:16-alpine` | 5432 | Lakekeeper metadata |
 | Lakekeeper | `quay.io/lakekeeper/catalog:v0.10.4` | 8181 | Iceberg REST Catalog |
-| AutoMQ | `automqinc/automq:latest` | 9092, 9093 | Kafka-compatible with Table Topics |
-| Redis | `redis:7.2-alpine` | 6379 | Force sampling rules cache |
+| AutoMQ | `automqinc/automq:latest` | 9092, 9093 | Kafka with Table Topic (writes to Iceberg) |
+| Redis | `redis:7.2-alpine` | 6379 | Deduplication and force sampling rules |
 | Prometheus | `prom/prometheus:v2.48.0` | 9091 | Metrics collection |
 
 ## Quick Start (Recommended)
@@ -128,10 +139,35 @@ export TSS__REDIS__URL="redis://localhost:6379"
 cargo run --release
 ```
 
-### Step 7: (Optional) Start AutoMQ
+### Step 7: Start AutoMQ with Table Topic
+
+AutoMQ Table Topic automatically streams Kafka messages to Iceberg. The configuration is in docker-compose.yml:
 
 ```bash
-docker compose up -d automq automq-init
+docker compose up -d kafka kafka-init
+```
+
+The kafka-init service creates the topic with Table Topic enabled:
+- `automq.table.topic.enable=true` - Enables Iceberg streaming
+- `automq.table.topic.namespace=default` - Iceberg namespace
+- `automq.table.topic.commit.interval.ms=60000` - 1 minute commits
+
+**Data flow**: OTEL → AutoMQ (Kafka) → Iceberg (automatic) → App (queries only)
+
+## Running Demo Traces
+
+### Generate Test Traces
+
+```bash
+# Start the simple producer to generate test traces
+cargo run --release --bin simple_producer
+```
+
+### Generate Long-Running Traces
+
+```bash
+# Simulate batch job traces (30-50 minutes)
+cargo run --release --bin simple_producer -- --long-running --duration-minutes 30
 ```
 
 ## Verification Commands

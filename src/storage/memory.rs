@@ -187,25 +187,39 @@ impl TraceStore for MemoryTraceStore {
         let now = Instant::now();
         let mut ready_traces = Vec::new();
 
+        let now_epoch_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as i64)
+            .unwrap_or(0);
+
         for (trace_id, metadata) in inner.trace_metadata.iter_mut() {
             if metadata.status != TraceStatus::Active {
                 continue;
             }
 
             let time_since_last_activity = now.duration_since(metadata.last_activity);
+            let total_trace_duration_ms = (now_epoch_ms - metadata.first_span_time).max(0) as u64;
+            let total_trace_duration = Duration::from_millis(total_trace_duration_ms);
+
+            if total_trace_duration > self.max_trace_duration {
+                debug!(
+                    "Trace {} exceeded max duration ({:?} > {:?}), forcing export",
+                    trace_id, total_trace_duration, self.max_trace_duration
+                );
+                metadata.status = TraceStatus::ForceExport;
+                ready_traces.push(trace_id.clone());
+                continue;
+            }
 
             let has_root_span = metadata.root_span_id.is_some();
-            let root_span_inactivity = if has_root_span {
+            let effective_inactivity_threshold = if has_root_span {
                 Duration::from_secs(30)
             } else {
                 inactivity_threshold
             };
 
-            if time_since_last_activity > root_span_inactivity {
+            if time_since_last_activity > effective_inactivity_threshold {
                 metadata.status = TraceStatus::ReadyForExport;
-                ready_traces.push(trace_id.clone());
-            } else if time_since_last_activity > self.max_trace_duration {
-                metadata.status = TraceStatus::ForceExport;
                 ready_traces.push(trace_id.clone());
             }
         }

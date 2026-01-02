@@ -2,31 +2,20 @@ use super::{IngestResult, StorageType, StoreStats, TraceStore};
 use crate::sampling::policies::TraceSummary;
 use crate::state::{BufferedSpan, SpanKind};
 use anyhow::{Context, Result};
-use arrow_array::{Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray};
-use arrow_schema::{DataType, Field, Schema as ArrowSchema};
+use arrow_array::{Array, Int32Array, Int64Array, RecordBatch, StringArray};
 use async_trait::async_trait;
 use datafusion::prelude::*;
 use futures::TryStreamExt;
 use iceberg::expr::Reference;
-use iceberg::spec::DataFileFormat;
-use iceberg::transaction::{ApplyTransactionAction, Transaction};
-use iceberg::writer::base_writer::data_file_writer::DataFileWriterBuilder;
-use iceberg::writer::file_writer::location_generator::{
-    DefaultFileNameGenerator, DefaultLocationGenerator,
-};
-use iceberg::writer::file_writer::ParquetWriterBuilder;
-use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
 use iceberg::{Catalog, CatalogBuilder, TableIdent};
 use iceberg_catalog_rest::RestCatalogBuilder;
 use iceberg_datafusion::IcebergTableProvider;
 use parking_lot::RwLock;
-use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
-use parquet::file::properties::WriterProperties;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::OnceCell;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 #[derive(Debug, Clone)]
 pub struct IcebergConfig {
@@ -232,85 +221,6 @@ impl IcebergTraceStore {
         self.catalog
             .get()
             .ok_or_else(|| anyhow::anyhow!("Catalog not initialized"))
-    }
-
-    fn spans_to_record_batch(&self, spans: &[BufferedSpan]) -> Result<RecordBatch> {
-        let trace_ids: Vec<&str> = spans.iter().map(|s| s.trace_id.as_str()).collect();
-        let span_ids: Vec<&str> = spans.iter().map(|s| s.span_id.as_str()).collect();
-        let parent_span_ids: Vec<Option<&str>> = spans
-            .iter()
-            .map(|s| s.parent_span_id.as_deref())
-            .collect();
-        let timestamps: Vec<i64> = spans.iter().map(|s| s.timestamp_ms).collect();
-        let durations: Vec<i64> = spans.iter().map(|s| s.duration_ms).collect();
-        let status_codes: Vec<i32> = spans.iter().map(|s| s.status_code).collect();
-        let span_kinds: Vec<i32> = spans.iter().map(|s| s.span_kind.clone() as i32).collect();
-        let service_names: Vec<&str> = spans.iter().map(|s| s.service_name.as_str()).collect();
-        let operation_names: Vec<&str> = spans.iter().map(|s| s.operation_name.as_str()).collect();
-
-        fn field_with_id(id: i32, name: &str, data_type: DataType, nullable: bool) -> Field {
-            Field::new(name, data_type, nullable).with_metadata(HashMap::from([(
-                PARQUET_FIELD_ID_META_KEY.to_string(),
-                id.to_string(),
-            )]))
-        }
-
-        let schema = Arc::new(ArrowSchema::new(vec![
-            field_with_id(1, "trace_id", DataType::Utf8, false),
-            field_with_id(2, "span_id", DataType::Utf8, false),
-            field_with_id(3, "parent_span_id", DataType::Utf8, true),
-            field_with_id(4, "timestamp_ms", DataType::Int64, false),
-            field_with_id(5, "duration_ms", DataType::Int64, false),
-            field_with_id(6, "status_code", DataType::Int32, false),
-            field_with_id(7, "span_kind", DataType::Int32, true),
-            field_with_id(8, "service_name", DataType::Utf8, false),
-            field_with_id(9, "operation_name", DataType::Utf8, false),
-        ]));
-
-        let batch = RecordBatch::try_new(
-            schema,
-            vec![
-                Arc::new(StringArray::from(trace_ids)) as ArrayRef,
-                Arc::new(StringArray::from(span_ids)) as ArrayRef,
-                Arc::new(StringArray::from(parent_span_ids)) as ArrayRef,
-                Arc::new(Int64Array::from(timestamps)) as ArrayRef,
-                Arc::new(Int64Array::from(durations)) as ArrayRef,
-                Arc::new(Int32Array::from(status_codes)) as ArrayRef,
-                Arc::new(Int32Array::from(span_kinds)) as ArrayRef,
-                Arc::new(StringArray::from(service_names)) as ArrayRef,
-                Arc::new(StringArray::from(operation_names)) as ArrayRef,
-            ],
-        )
-        .context("Failed to create RecordBatch")?;
-
-        Ok(batch)
-    }
-
-    fn update_cache_for_spans(&self, spans: &[BufferedSpan]) {
-        let mut cache = self.metadata_cache.write();
-        let now = Instant::now();
-
-        for span in spans {
-            let entry = cache
-                .traces
-                .entry(span.trace_id.clone())
-                .or_insert(CachedTraceMeta {
-                    has_error: false,
-                    max_duration_ms: 0,
-                    span_count: 0,
-                    min_timestamp_ms: i64::MAX,
-                    max_timestamp_ms: 0,
-                    last_seen: now,
-                    processing: false,
-                });
-
-            entry.span_count += 1;
-            entry.has_error = entry.has_error || span.status_code == 2;
-            entry.max_duration_ms = entry.max_duration_ms.max(span.duration_ms);
-            entry.min_timestamp_ms = entry.min_timestamp_ms.min(span.timestamp_ms);
-            entry.max_timestamp_ms = entry.max_timestamp_ms.max(span.timestamp_ms);
-            entry.last_seen = now;
-        }
     }
 
     async fn refresh_metadata_cache(&self) -> Result<()> {
@@ -520,134 +430,18 @@ impl TraceStore for IcebergTraceStore {
             });
         }
 
-        let catalog = self.get_catalog()?;
-        let batch = self.spans_to_record_batch(spans)?;
-        let span_count = batch.num_rows();
+        let span_count = spans.len();
+        warn!(
+            span_count = span_count,
+            "IcebergTraceStore.ingest() called but writes are handled by AutoMQ Table Topic. \
+             Data flows: Kafka -> AutoMQ Table Topic -> Iceberg (automatic). \
+             This store is read-only for sampling decisions."
+        );
 
-        // Retry loop for optimistic concurrency conflicts
-        const MAX_RETRIES: u32 = 5;
-        let mut last_error = None;
-
-        for attempt in 0..MAX_RETRIES {
-            // Load fresh table metadata on each attempt to get latest version
-            let table = match catalog.load_table(&self.table_ident).await {
-                Ok(t) => t,
-                Err(e) => {
-                    last_error = Some(anyhow::anyhow!("Failed to load table: {}", e));
-                    debug!(attempt = attempt + 1, error = %e, "Failed to load table");
-                    tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
-                    continue;
-                }
-            };
-
-            let location_generator = match DefaultLocationGenerator::new(table.metadata().clone()) {
-                Ok(g) => g,
-                Err(e) => {
-                    last_error = Some(anyhow::anyhow!("Failed to create location generator: {}", e));
-                    debug!(attempt = attempt + 1, error = %e, "Failed to create location generator");
-                    continue;
-                }
-            };
-            // Use UUID suffix to ensure unique file names across writer instances
-            // Without this, each writer starts file_count at 0, causing "data-00000.parquet" collisions
-            let unique_suffix = uuid::Uuid::new_v4().to_string();
-            let file_name_generator =
-                DefaultFileNameGenerator::new("data".to_string(), Some(unique_suffix), DataFileFormat::Parquet);
-
-            let parquet_props = WriterProperties::builder().build();
-
-            let parquet_writer_builder = ParquetWriterBuilder::new(
-                parquet_props,
-                table.metadata().current_schema().clone(),
-                None,
-                table.file_io().clone(),
-                location_generator,
-                file_name_generator,
-            );
-
-            let data_file_writer_builder =
-                DataFileWriterBuilder::new(parquet_writer_builder, None, 0);
-            let mut data_file_writer = match data_file_writer_builder.build().await {
-                Ok(w) => w,
-                Err(e) => {
-                    last_error = Some(anyhow::anyhow!("Failed to build data file writer: {}", e));
-                    debug!(attempt = attempt + 1, error = %e, "Failed to build data file writer");
-                    continue;
-                }
-            };
-
-            if let Err(e) = data_file_writer.write(batch.clone()).await {
-                last_error = Some(anyhow::anyhow!("Failed to write batch: {}", e));
-                debug!(attempt = attempt + 1, error = %e, "Failed to write batch");
-                continue;
-            }
-
-            let data_files = match data_file_writer.close().await {
-                Ok(f) => f,
-                Err(e) => {
-                    last_error = Some(anyhow::anyhow!("Failed to close writer: {}", e));
-                    debug!(attempt = attempt + 1, error = %e, "Failed to close writer");
-                    continue;
-                }
-            };
-
-            if data_files.is_empty() {
-                return Ok(IngestResult {
-                    added: 0,
-                    dropped: 0,
-                });
-            }
-
-            debug!(attempt = attempt + 1, file_count = data_files.len(), "Data files written, creating transaction");
-
-            let tx = Transaction::new(&table);
-            let action = tx.fast_append().add_data_files(data_files);
-
-            let tx = match action.apply(tx) {
-                Ok(tx) => tx,
-                Err(e) => {
-                    last_error = Some(anyhow::anyhow!("Failed to apply action: {}", e));
-                    debug!(attempt = attempt + 1, error = %e, "Failed to apply transaction action");
-                    continue;
-                }
-            };
-
-            debug!(attempt = attempt + 1, "Committing transaction to catalog");
-
-            match tx.commit(catalog.as_ref()).await {
-                Ok(_updated_table) => {
-                    self.update_cache_for_spans(spans);
-
-                    if attempt > 0 {
-                        debug!(
-                            span_count = span_count,
-                            attempt = attempt + 1,
-                            "Ingested spans to Iceberg after retry"
-                        );
-                    } else {
-                        info!(span_count = span_count, "Ingested spans to Iceberg");
-                    }
-
-                    return Ok(IngestResult {
-                        added: span_count,
-                        dropped: 0,
-                    });
-                }
-                Err(e) => {
-                    last_error = Some(anyhow::anyhow!("Failed to commit transaction: {}", e));
-                    debug!(
-                        attempt = attempt + 1,
-                        max_retries = MAX_RETRIES,
-                        error = %e,
-                        "Iceberg commit failed, retrying with fresh table metadata"
-                    );
-                    // Small delay before retry to reduce contention
-                    tokio::time::sleep(Duration::from_millis(50 * (attempt as u64 + 1))).await;
-                }
-            }
-        }
-
-        Err(last_error.unwrap_or_else(|| anyhow::anyhow!("Failed to commit after {} retries", MAX_RETRIES)))
+        Ok(IngestResult {
+            added: 0,
+            dropped: span_count,
+        })
     }
 
     async fn get_ready_traces(&self, inactivity_threshold: Duration) -> Result<Vec<String>> {

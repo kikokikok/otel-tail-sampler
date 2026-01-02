@@ -12,28 +12,56 @@ A production-ready, Rust-based tail sampling selector for distributed tracing pi
 
 ## Architecture
 
+### Standard Mode (In-Memory)
+
 ```
 ┌─────────────────┐     ┌─────────────────────┐     ┌─────────────────┐
 │ OpenTelemetry   │────▶│  Kafka              │────▶│  Tail Sampling  │
 │ Agents          │     │  (otel-traces-raw)  │     │  Selector       │
 └─────────────────┘     └─────────────────────┘     └────────┬────────┘
-                                                            │
-                          ┌─────────────────────────────────┘
-                          │
-                          ▼
-                   ┌──────────────┐     ┌─────────────────┐
-                   │  Redis       │────▶│  Datadog        │
-                   │  (TTL State) │     │  (Export)       │
-                   └──────────────┘     └─────────────────┘
+                                                             │
+                           ┌─────────────────────────────────┘
+                           │
+                           ▼
+                    ┌──────────────┐     ┌─────────────────┐
+                    │  Redis       │────▶│  Datadog        │
+                    │  (TTL State) │     │  (Export)       │
+                    └──────────────┘     └─────────────────┘
 ```
+
+### AutoMQ Table Topic Mode (Iceberg Storage)
+
+For massive-scale deployments with long-running traces, AutoMQ Table Topic provides native Kafka→Iceberg streaming:
+
+```
+┌─────────────────┐     ┌─────────────────────┐     ┌─────────────────┐
+│ OpenTelemetry   │────▶│  AutoMQ Kafka       │────▶│  Apache Iceberg │
+│ Agents          │     │  (Table Topic)      │     │  (via AutoMQ)   │
+└─────────────────┘     └─────────────────────┘     └────────┬────────┘
+                                                             │
+                        ┌────────────────────────────────────┘
+                        │ Query (read-only)
+                        ▼
+                 ┌─────────────────┐     ┌──────────────┐     ┌─────────────┐
+                 │ Tail Sampling   │────▶│  Redis       │────▶│  Datadog    │
+                 │ Selector        │     │  (TTL State) │     │  (Export)   │
+                 └─────────────────┘     └──────────────┘     └─────────────┘
+```
+
+**Key benefits of AutoMQ Table Topic mode:**
+- **Zero-code Kafka→Iceberg**: AutoMQ streams data to Iceberg natively (no application writes)
+- **Horizontal scalability**: Iceberg enables query parallelism across partitions
+- **Long-running traces**: Hours-long traces without memory pressure
+- **Historical analysis**: Query historical traces directly from Iceberg
 
 ## Quick Start
 
 ### Prerequisites
 
 - Rust 1.75+
-- Kafka 2.8+
+- Kafka 2.8+ (or AutoMQ for Table Topic mode)
 - Redis 7.0+
+- (Optional) Lakekeeper + MinIO for Iceberg storage
 
 ### Development
 
@@ -84,6 +112,45 @@ TSS_KAFKA_BROKERS=kafka:29092 \
 TSS_REDIS_URL=redis://redis:6379 \
 TSS_DATADOG_API_KEY=your-key \
 ./target/release/tail-sampling-selector
+```
+
+### Iceberg Storage with AutoMQ Table Topic
+
+For large-scale deployments with long-running traces, enable Iceberg storage:
+
+```yaml
+storage:
+  storage_type: "iceberg"
+  iceberg:
+    catalog_uri: "http://lakekeeper:8181/catalog"
+    warehouse: "s3://iceberg-warehouse/traces/"
+    namespace: "default"
+    table_name: "otel_traces"
+    s3_endpoint: "http://minio:9000"
+    s3_access_key_id: "admin"
+    s3_secret_access_key: "password"
+    s3_region: "us-east-1"
+    s3_path_style: true
+```
+
+AutoMQ Table Topic configuration (in docker-compose or Kafka broker config):
+
+```bash
+# Cluster-level settings
+automq.table.topic.catalog.type=rest
+automq.table.topic.catalog.uri=http://lakekeeper:8181/catalog
+automq.table.topic.catalog.warehouse=s3://iceberg-warehouse/traces/
+
+# Topic-level settings (via kafka-configs or topic creation)
+automq.table.topic.enable=true
+automq.table.topic.namespace=default
+automq.table.topic.commit.interval.ms=60000
+```
+
+Build with Iceberg support:
+
+```bash
+cargo build --release --features iceberg-storage
 ```
 
 ## Health Checks

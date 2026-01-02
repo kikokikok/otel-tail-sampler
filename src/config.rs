@@ -69,10 +69,10 @@ const fn default_evaluation_workers() -> usize {
     4
 }
 const fn default_inactivity_timeout_secs() -> u64 {
-    60
+    300
 }
 const fn default_max_trace_duration_secs() -> u64 {
-    300
+    3600
 }
 
 #[derive(Debug, Deserialize, Clone)]

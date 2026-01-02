@@ -6,8 +6,8 @@ app:
   shutdown_timeout_secs: 30
   evaluation_workers: 4
   graceful_shutdown: true
-  inactivity_timeout_secs: 60
-  max_trace_duration_secs: 300
+  inactivity_timeout_secs: 300
+  max_trace_duration_secs: 3600
 
 kafka:
   brokers: "localhost:9092"
@@ -23,7 +23,7 @@ redis:
   db: 0
   pool_size: 10
   connection_timeout_secs: 5
-  trace_ttl_secs: 30
+  trace_ttl_secs: 7200
   cluster_enabled: false
 
 datadog:

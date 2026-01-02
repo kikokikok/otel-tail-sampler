@@ -29,17 +29,29 @@ This guide covers deploying the Tail Sampling Selector to Kubernetes using Helm,
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | Kubernetes | 1.20+ | Container orchestration |
-| Kafka | 2.8+ | Trace ingestion |
+| Kafka/AutoMQ | 2.8+ | Trace ingestion |
 | Redis | 7.0+ | State caching |
 | KEDA | 2.10+ | Autoscaling (optional) |
+| Lakekeeper | 0.10+ | Iceberg REST Catalog (optional) |
+| MinIO/S3 | - | Object storage for Iceberg (optional) |
 
 ### Memory Requirements
 
+**Memory Mode (default)**:
 | Component | CPU | Memory |
 |-----------|-----|--------|
 | Minimum per pod | 250m | 256Mi |
 | Recommended | 500m | 512Mi |
 | Maximum | 1000m | 1Gi |
+
+**Iceberg Mode** (read-only, AutoMQ writes):
+| Component | CPU | Memory |
+|-----------|-----|--------|
+| Minimum per pod | 250m | 128Mi |
+| Recommended | 500m | 256Mi |
+| Maximum | 1000m | 512Mi |
+
+Iceberg mode uses significantly less memory since spans are stored in Iceberg, not in-memory.
 
 ---
 
@@ -83,6 +95,121 @@ kubectl logs -n tail-sampling -l app=tail-sampling-selector
 
 # Check health
 curl http://<service-ip>:8080/health
+```
+
+---
+
+## Iceberg Storage Mode (AutoMQ Table Topic)
+
+For production deployments with long-running traces (batch jobs, ETL pipelines), use Iceberg storage with AutoMQ Table Topic. In this mode, **AutoMQ writes to Iceberg automatically** and the application is read-only.
+
+### Architecture
+
+```
+OTEL → AutoMQ (Table Topic) → Iceberg → App (queries) → Datadog
+       └── automatic writes ──┘       └── read-only ──┘
+```
+
+### Prerequisites
+
+- AutoMQ with Table Topic support
+- Lakekeeper (Iceberg REST Catalog) or Databricks Unity Catalog
+- S3-compatible object storage (MinIO, AWS S3, etc.)
+
+### Helm Configuration for Iceberg
+
+```yaml
+# iceberg-values.yaml
+image:
+  repository: ghcr.io/your-org/tail-sampling-selector
+  tag: "v1.2.0-iceberg"  # Built with --features iceberg-storage
+
+config:
+  storage:
+    storageType: "iceberg"
+    iceberg:
+      catalogUri: "http://lakekeeper.observability:8181/catalog"
+      warehouse: "traces"
+      namespace: "default"
+      tableName: "otel_spans"
+      projectId: "your-project-uuid"
+      s3Endpoint: "http://minio.storage:9000"
+      s3AccessKeyId: ""  # Set via secret
+      s3SecretAccessKey: ""  # Set via secret
+      s3Region: "us-east-1"
+      s3PathStyle: true
+
+  app:
+    inactivityTimeoutSecs: 300   # 5 minutes
+    maxTraceDurationSecs: 3600   # 1 hour max trace duration
+
+  redis:
+    url: "redis://redis-master:6379"
+    traceTtlSecs: 7200  # 2 hours (> max trace duration)
+
+env:
+  - name: TSS__STORAGE__ICEBERG__S3_ACCESS_KEY_ID
+    valueFrom:
+      secretKeyRef:
+        name: s3-credentials
+        key: access-key-id
+  - name: TSS__STORAGE__ICEBERG__S3_SECRET_ACCESS_KEY
+    valueFrom:
+      secretKeyRef:
+        name: s3-credentials
+        key: secret-access-key
+```
+
+### AutoMQ Configuration
+
+Configure AutoMQ Table Topic at the cluster and topic level:
+
+**Cluster-level** (AutoMQ broker config):
+```properties
+automq.table.topic.catalog.type=rest
+automq.table.topic.catalog.uri=http://lakekeeper.observability:8181/catalog
+automq.table.topic.catalog.warehouse=s3://iceberg-warehouse/traces/
+```
+
+**Topic-level** (when creating otel-traces-raw topic):
+```bash
+kafka-topics.sh --create --topic otel-traces-raw \
+  --partitions 6 --replication-factor 3 \
+  --config automq.table.topic.enable=true \
+  --config automq.table.topic.namespace=default \
+  --config automq.table.topic.commit.interval.ms=60000
+```
+
+### Deploying with Iceberg
+
+```bash
+# Create S3 credentials secret
+kubectl create secret generic s3-credentials \
+  --from-literal=access-key-id=YOUR_ACCESS_KEY \
+  --from-literal=secret-access-key=YOUR_SECRET_KEY \
+  -n tail-sampling
+
+# Deploy with Iceberg configuration
+helm upgrade --install tail-sampling-selector \
+  ./helm-charts/tail-sampling-selector \
+  --namespace tail-sampling \
+  --values iceberg-values.yaml \
+  --wait
+```
+
+### Verifying Iceberg Mode
+
+```bash
+# Check storage stats
+curl http://<service-ip>:8080/admin/store/stats | jq .
+
+# Expected output shows "iceberg" storage type:
+# {
+#   "storage_type": "iceberg",
+#   "span_count": 0,
+#   "trace_count": 0,
+#   "memory_bytes": 0
+# }
 ```
 
 ---

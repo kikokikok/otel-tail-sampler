@@ -43,6 +43,109 @@ fn generate_span_id() -> [u8; 8] {
     id
 }
 
+fn generate_long_running_span(
+    trace_id: &[u8; 16],
+    parent_span_id: Option<&[u8]>,
+    service_name: &str,
+    operation: &str,
+    span_index: usize,
+    with_error: bool,
+) -> Vec<u8> {
+    let span_id = generate_span_id();
+    let now = SystemTime::UNIX_EPOCH
+        .elapsed()
+        .unwrap_or(Duration::ZERO)
+        .as_nanos() as u64;
+
+    let duration_ns = ((100 + (span_index % 500)) * 1_000_000) as u64;
+
+    let status = if with_error {
+        Some(Status {
+            code: StatusCode::Error as i32,
+            message: format!("Batch job error at step {}", span_index),
+        })
+    } else {
+        Some(Status {
+            code: StatusCode::Ok as i32,
+            message: String::new(),
+        })
+    };
+
+    let span = Span {
+        trace_id: trace_id.to_vec(),
+        span_id: span_id.to_vec(),
+        parent_span_id: parent_span_id.map(|p| p.to_vec()).unwrap_or_default(),
+        name: operation.to_string(),
+        start_time_unix_nano: now - duration_ns,
+        end_time_unix_nano: now,
+        status,
+        attributes: vec![
+            opentelemetry_proto::tonic::common::v1::KeyValue {
+                key: "batch.step".to_string(),
+                value: Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+                    value: Some(
+                        opentelemetry_proto::tonic::common::v1::any_value::Value::IntValue(
+                            span_index as i64,
+                        ),
+                    ),
+                }),
+            },
+            opentelemetry_proto::tonic::common::v1::KeyValue {
+                key: "batch.type".to_string(),
+                value: Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+                    value: Some(
+                        opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                            "long_running".to_string(),
+                        ),
+                    ),
+                }),
+            },
+        ],
+        ..Default::default()
+    };
+
+    let scope_spans = ScopeSpans {
+        scope: None,
+        spans: vec![span],
+        schema_url: String::new(),
+    };
+
+    let resource_spans = ResourceSpans {
+        resource: Some(opentelemetry_proto::tonic::resource::v1::Resource {
+            attributes: vec![
+                opentelemetry_proto::tonic::common::v1::KeyValue {
+                    key: "service.name".to_string(),
+                    value: Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+                        value: Some(
+                            opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                                service_name.to_string(),
+                            ),
+                        ),
+                    }),
+                },
+                opentelemetry_proto::tonic::common::v1::KeyValue {
+                    key: "deployment.environment".to_string(),
+                    value: Some(opentelemetry_proto::tonic::common::v1::AnyValue {
+                        value: Some(
+                            opentelemetry_proto::tonic::common::v1::any_value::Value::StringValue(
+                                "batch".to_string(),
+                            ),
+                        ),
+                    }),
+                },
+            ],
+            dropped_attributes_count: 0,
+            entity_refs: vec![],
+        }),
+        scope_spans: vec![scope_spans],
+        schema_url: String::new(),
+    };
+
+    let mut payload = Vec::new();
+    resource_spans.encode(&mut payload).unwrap();
+    payload
+}
+
 fn generate_trace_payload(
     trace_idx: usize,
     with_error: bool,
@@ -168,15 +271,25 @@ fn print_usage() {
     eprintln!("Usage: simple_producer [OPTIONS]");
     eprintln!();
     eprintln!("Options:");
-    eprintln!("  --traces N       Number of traces to send (default: 10)");
-    eprintln!("  --spans N        Spans per trace (default: 5)");
-    eprintln!("  --batch N        Batch size for parallel sends (default: 10)");
-    eprintln!("  --error-rate N   Error rate percentage (default: 10)");
-    eprintln!("  --slow-rate N    Slow trace rate percentage (default: 5)");
-    eprintln!("  --quiet          Suppress individual trace output");
+    eprintln!("  --traces N          Number of traces to send (default: 10)");
+    eprintln!("  --spans N           Spans per trace (default: 5)");
+    eprintln!("  --batch N           Batch size for parallel sends (default: 10)");
+    eprintln!("  --error-rate N      Error rate percentage (default: 10)");
+    eprintln!("  --slow-rate N       Slow trace rate percentage (default: 5)");
+    eprintln!("  --quiet             Suppress individual trace output");
+    eprintln!("  --long-running      Enable long-running trace simulation mode");
+    eprintln!("  --duration-minutes N  Duration in minutes for long-running traces (default: 30)");
+    eprintln!("  --span-interval N   Seconds between spans in long-running mode (default: 30)");
     eprintln!();
     eprintln!("Environment:");
-    eprintln!("  KAFKA_BROKERS    Kafka broker addresses (default: 127.0.0.1:9092)");
+    eprintln!("  KAFKA_BROKERS       Kafka broker addresses (default: 127.0.0.1:9092)");
+    eprintln!();
+    eprintln!("Examples:");
+    eprintln!("  # Send 100 quick traces");
+    eprintln!("  simple_producer --traces 100 --spans 10");
+    eprintln!();
+    eprintln!("  # Simulate 3 long-running batch jobs (30 min each)");
+    eprintln!("  simple_producer --long-running --traces 3 --duration-minutes 30");
 }
 
 #[tokio::main]
@@ -189,6 +302,9 @@ async fn main() {
     let mut error_rate: usize = 10;
     let mut slow_rate: usize = 5;
     let mut quiet = false;
+    let mut long_running = false;
+    let mut duration_minutes: u64 = 30;
+    let mut span_interval_secs: u64 = 30;
 
     let mut i = 1;
     while i < args.len() {
@@ -217,6 +333,18 @@ async fn main() {
                 quiet = true;
                 i += 1;
             }
+            "--long-running" => {
+                long_running = true;
+                i += 1;
+            }
+            "--duration-minutes" => {
+                duration_minutes = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(30);
+                i += 2;
+            }
+            "--span-interval" => {
+                span_interval_secs = args.get(i + 1).and_then(|s| s.parse().ok()).unwrap_or(30);
+                i += 2;
+            }
             "--help" | "-h" => {
                 print_usage();
                 return;
@@ -229,6 +357,179 @@ async fn main() {
         }
     }
 
+    if long_running {
+        run_long_running_mode(num_traces, duration_minutes, span_interval_secs, error_rate, quiet).await;
+    } else {
+        run_standard_mode(num_traces, spans_per_trace, batch_size, error_rate, slow_rate, quiet).await;
+    }
+}
+
+const BATCH_OPERATIONS: &[&str] = &[
+    "batch.etl.extract",
+    "batch.etl.transform",
+    "batch.etl.load",
+    "batch.partition.process",
+    "batch.checkpoint.save",
+    "batch.validation.run",
+    "batch.aggregation.compute",
+    "batch.output.write",
+];
+
+async fn run_long_running_mode(
+    num_traces: usize,
+    duration_minutes: u64,
+    span_interval_secs: u64,
+    error_rate: usize,
+    quiet: bool,
+) {
+    println!("╔════════════════════════════════════════════════════════╗");
+    println!("║   Long-Running Trace Simulation (Batch Job Mode)       ║");
+    println!("╚════════════════════════════════════════════════════════╝\n");
+
+    let brokers = std::env::var("KAFKA_BROKERS").unwrap_or_else(|_| "127.0.0.1:9092".to_string());
+    let topic = "otel-traces-raw";
+
+    let total_spans_per_trace = (duration_minutes * 60 / span_interval_secs) as usize;
+
+    println!("Configuration:");
+    println!("  Kafka Brokers:      {}", brokers);
+    println!("  Topic:              {}", topic);
+    println!("  Concurrent traces:  {}", num_traces);
+    println!("  Duration per trace: {} minutes", duration_minutes);
+    println!("  Span interval:      {} seconds", span_interval_secs);
+    println!("  Spans per trace:    ~{}", total_spans_per_trace);
+    println!("  Error rate:         {}%", error_rate);
+    println!();
+    println!("This will simulate {} batch job(s) running for {} minutes each.", num_traces, duration_minutes);
+    println!("Press Ctrl+C to stop early.\n");
+
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &brokers)
+        .set("broker.address.family", "v4")
+        .set("acks", "all")
+        .set("message.timeout.ms", "30000")
+        .set("request.timeout.ms", "30000")
+        .set("metadata.max.age.ms", "60000")
+        .set("socket.timeout.ms", "30000")
+        .create()
+        .expect("Failed to create producer");
+
+    let trace_ids: Vec<[u8; 16]> = (0..num_traces).map(|_| generate_trace_id()).collect();
+    let root_span_ids: Vec<[u8; 8]> = (0..num_traces).map(|_| generate_span_id()).collect();
+
+    let start_time = Instant::now();
+    let total_duration = Duration::from_secs(duration_minutes * 60);
+    let span_interval = Duration::from_secs(span_interval_secs);
+
+    let sent_count = Arc::new(AtomicUsize::new(0));
+    let error_count = Arc::new(AtomicUsize::new(0));
+    let mut span_index = 0usize;
+
+    println!("Sending spans...\n");
+
+    while start_time.elapsed() < total_duration {
+        for (trace_idx, (trace_id, root_span_id)) in trace_ids.iter().zip(root_span_ids.iter()).enumerate() {
+            let with_error = span_index > 0 && (trace_idx * 100 / num_traces.max(1)) < error_rate && span_index == total_spans_per_trace - 1;
+            
+            if with_error {
+                error_count.fetch_add(1, Ordering::SeqCst);
+            }
+
+            let service_name = format!("batch-job-{}", trace_idx);
+            let operation = BATCH_OPERATIONS[span_index % BATCH_OPERATIONS.len()];
+            let parent = if span_index == 0 { None } else { Some(root_span_id.as_slice()) };
+
+            let payload = generate_long_running_span(
+                trace_id,
+                parent,
+                &service_name,
+                operation,
+                span_index,
+                with_error,
+            );
+
+            let trace_id_hex = hex::encode(trace_id);
+            let key = format!("trace-{}", trace_id_hex);
+            let record = FutureRecord::to(topic).key(&key).payload(&payload);
+
+            match producer.send(record, Duration::from_secs(10)).await {
+                Ok(_) => {
+                    sent_count.fetch_add(1, Ordering::SeqCst);
+                    if !quiet {
+                        let elapsed = start_time.elapsed();
+                        let remaining = total_duration.saturating_sub(elapsed);
+                        let status = if with_error { "\x1b[31mERROR\x1b[0m" } else { "\x1b[32mOK\x1b[0m" };
+                        println!(
+                            "  [{}] Trace {} | Step {:>3} | {} | Remaining: {:>3}m {:>2}s",
+                            status,
+                            trace_idx,
+                            span_index,
+                            operation,
+                            remaining.as_secs() / 60,
+                            remaining.as_secs() % 60
+                        );
+                    }
+                }
+                Err((e, _)) => {
+                    eprintln!("  Failed to send span: {:?}", e);
+                }
+            }
+        }
+
+        span_index += 1;
+
+        if quiet {
+            let elapsed = start_time.elapsed();
+            let remaining = total_duration.saturating_sub(elapsed);
+            print!(
+                "\r  Progress: {} spans sent | Elapsed: {}m {}s | Remaining: {}m {}s     ",
+                sent_count.load(Ordering::SeqCst),
+                elapsed.as_secs() / 60,
+                elapsed.as_secs() % 60,
+                remaining.as_secs() / 60,
+                remaining.as_secs() % 60
+            );
+            std::io::Write::flush(&mut std::io::stdout()).ok();
+        }
+
+        tokio::time::sleep(span_interval).await;
+    }
+
+    if quiet {
+        println!();
+    }
+
+    println!("\nFlushing...");
+    producer.flush(Duration::from_secs(30)).unwrap();
+
+    let elapsed = start_time.elapsed();
+    let sent = sent_count.load(Ordering::SeqCst);
+    let errors = error_count.load(Ordering::SeqCst);
+
+    println!("\n╔════════════════════════════════════════════════════════╗");
+    println!("║              Long-Running Simulation Complete          ║");
+    println!("╠════════════════════════════════════════════════════════╣");
+    println!("║  Traces simulated:  {:>6}                             ║", num_traces);
+    println!("║  Total spans sent:  {:>6}                             ║", sent);
+    println!("║  Error traces:      {:>6}                             ║", errors);
+    println!("║  Duration:          {:>6.1} minutes                    ║", elapsed.as_secs_f64() / 60.0);
+    println!("║  Spans per trace:   {:>6}                             ║", span_index);
+    println!("╚════════════════════════════════════════════════════════╝");
+    println!();
+    println!("Next steps:");
+    println!("  • Traces should be force-exported after max_trace_duration_secs");
+    println!("  • Check metrics: curl http://localhost:9090/metrics | grep tail_sampling");
+    println!("  • View buffer:   curl http://localhost:8080/admin/store/stats | jq .");
+}
+
+async fn run_standard_mode(
+    num_traces: usize,
+    spans_per_trace: usize,
+    batch_size: usize,
+    error_rate: usize,
+    slow_rate: usize,
+    quiet: bool,
+) {
     println!("╔════════════════════════════════════════════════════════╗");
     println!("║       Tail-Sampling Demo Trace Producer                ║");
     println!("╚════════════════════════════════════════════════════════╝\n");
